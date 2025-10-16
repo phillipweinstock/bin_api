@@ -5,7 +5,7 @@
 
 ---
 
-## ✅ Implemented Features
+##  Implemented Features
 
 ### 1. **Deterministic Bin ID Generation**
 - **Format:** `BIN-XXXXXXXX`
@@ -42,32 +42,32 @@
 ### Core Backend Interface
 | Method | Endpoint | Description | Status |
 |--------|----------|-------------|--------|
-| POST | `/api/v1/telemetry` | Receive aggregated telemetry | ✅ Implemented |
-| GET | `/api/v1/commands/{bin_id}` | Fetch pending commands | ✅ Implemented |
-| POST | `/api/v1/commands/ack` | Acknowledge command completion | ✅ Implemented |
-| POST | `/api/v1/election` | Log election results | ✅ Implemented |
+| POST | `/api/v1/telemetry` | Receive aggregated telemetry |  Implemented |
+| GET | `/api/v1/commands/{bin_id}` | Fetch pending commands |  Implemented |
+| POST | `/api/v1/commands/ack` | Acknowledge command completion |  Implemented |
+| POST | `/api/v1/election` | Log election results |  Implemented |
 
 ### Node Discovery & Management
 | Method | Endpoint | Description | Status |
 |--------|----------|-------------|--------|
-| GET | `/api/v1/status` | Get master/slave status | ✅ Implemented |
-| POST | `/api/v1/discover` | Register discovered node (testing) | ✅ Implemented |
-| DELETE | `/api/v1/discover/{bin_id}` | Unregister node (testing) | ✅ Implemented |
-| POST | `/api/v1/cluster/rename` | Manually rename cluster | ✅ Implemented |
+| GET | `/api/v1/status` | Get master/slave status |  Implemented |
+| POST | `/api/v1/discover` | Register discovered node (testing) |  Implemented |
+| DELETE | `/api/v1/discover/{bin_id}` | Unregister node (testing) |  Implemented |
+| POST | `/api/v1/cluster/rename` | Manually rename cluster |  Implemented |
 
 ### Hardware Endpoints (Mock - Hardware Pending)
 | Method | Endpoint | Description | Status |
 |--------|----------|-------------|--------|
-| GET | `/api/v1/occupancy` | Get bin fill level | 🔶 Mock |
-| GET | `/api/v1/battery` | Get battery percentage | 🔶 Mock |
-| GET | `/api/v1/temperature` | Get temperature sensor | 🔶 Mock |
-| GET | `/api/v1/signal-strength` | Get BLE/WiFi RSSI | 🔶 Mock |
-| POST | `/api/v1/motor/dock` | Move to dock | 🔶 Mock |
-| POST | `/api/v1/motor/stop` | Emergency stop | 🔶 Mock |
+| GET | `/api/v1/occupancy` | Get bin fill level |  Mock |
+| GET | `/api/v1/battery` | Get battery percentage |  Mock |
+| GET | `/api/v1/temperature` | Get temperature sensor |  Mock |
+| GET | `/api/v1/signal-strength` | Get BLE/WiFi RSSI |  Mock |
+| POST | `/api/v1/motor/dock` | Move to dock |  Mock |
+| POST | `/api/v1/motor/stop` | Emergency stop |  Mock |
 
 ---
 
-## 🧪 Testing the API
+##  Testing the API
 
 ### Check Current Status
 ```bash
@@ -130,34 +130,34 @@ curl -X POST http://localhost:8000/api/v1/telemetry \
 
 ---
 
-## 🔄 Current System Behavior
+##  Current System Behavior
 
 ### Startup Sequence
-1. ✅ Generate deterministic bin ID from hardware
-2. ✅ Initialize as master with solo cluster name
-3. ✅ Start discovery process (30s timeout)
-4. ✅ If no nodes found → remain master
-5. ✅ Start periodic discovery (every 30s)
-6. ✅ Clean up stale nodes (60s timeout)
+1.  Generate deterministic bin ID from hardware
+2.  Initialize as master with solo cluster name
+3.  Start discovery process (30s timeout)
+4.  If no nodes found → remain master
+5.  Start periodic discovery (every 30s)
+6.  Clean up stale nodes (60s timeout)
 
 ### When Another Node Joins
 1. Node sends discovery message (or POST to `/api/v1/discover`)
-2. ✅ Add to discovered_nodes with timestamp
-3. ✅ Add to slaves list (if we're master)
-4. ✅ Regenerate cluster ID based on all members
-5. ✅ Log cluster rename
-6. 🔶 **TODO:** Trigger election if needed (based on scores)
+2.  Add to discovered_nodes with timestamp
+3.  Add to slaves list (if we're master)
+4.  Regenerate cluster ID based on all members
+5.  Log cluster rename
+6.  **TODO:** Trigger election if needed (based on scores)
 
 ### When Node Leaves
-1. ✅ Detected via heartbeat timeout (60s)
-2. ✅ Remove from discovered_nodes
-3. ✅ Remove from slaves list
-4. ✅ Regenerate cluster ID
-5. ✅ If no nodes left and not master → become master
+1.  Detected via heartbeat timeout (60s)
+2.  Remove from discovered_nodes
+3.  Remove from slaves list
+4.  Regenerate cluster ID
+5.  If no nodes left and not master → become master
 
 ---
 
-## 🚧 Not Yet Implemented (Hardware Pending)
+##  Not Yet Implemented (Hardware Pending)
 
 ### BLE Mesh Communication
 - [ ] BLE GATT server setup
@@ -190,7 +190,7 @@ curl -X POST http://localhost:8000/api/v1/telemetry \
 
 ---
 
-## 📊 System Architecture
+##  System Architecture
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -219,14 +219,14 @@ curl -X POST http://localhost:8000/api/v1/telemetry \
 ```
 
 **Current State:**
-- ✅ Master node REST API implemented
-- ✅ State management and election logic
-- 🔶 BLE mesh communication pending (hardware)
-- 🔶 Slave nodes pending (hardware)
+-  Master node REST API implemented
+-  State management and election logic
+-  BLE mesh communication pending (hardware)
+-  Slave nodes pending (hardware)
 
 ---
 
-## 🔧 Configuration
+##  Configuration
 
 ### Environment Variables (Future)
 ```bash
@@ -249,7 +249,7 @@ API_HOST=0.0.0.0
 
 ---
 
-## 📝 Next Steps
+##  Next Steps
 
 ### Phase 1: BLE Mesh (Hardware Required)
 1. Set up BLE GATT server on RPi5
@@ -272,7 +272,7 @@ API_HOST=0.0.0.0
 
 ---
 
-## 🐛 Known Issues
+##  Known Issues
 
 1. **Deprecation Warning:** Using deprecated `@app.on_event("startup")` 
    - **Fix:** Migrate to lifespan handlers (FastAPI 0.93+)
@@ -288,7 +288,7 @@ API_HOST=0.0.0.0
 
 ---
 
-## 📚 Documentation Files
+##  Documentation Files
 
 - `README.md` - Project overview and setup
 - `BLE_MESH_IMPLEMENTATION_NOTES.md` - Detailed BLE mesh spec
@@ -297,15 +297,15 @@ API_HOST=0.0.0.0
 
 ---
 
-## ✨ Summary
+##  Summary
 
 **Current State:** 
-- ✅ Core REST API complete and tested
-- ✅ Automatic ID generation working
-- ✅ Cluster naming functional
-- ✅ Master election logic implemented
-- 🔶 BLE mesh pending (hardware)
-- 🔶 Sensor integration pending (hardware)
+-  Core REST API complete and tested
+-  Automatic ID generation working
+-  Cluster naming functional
+-  Master election logic implemented
+-  BLE mesh pending (hardware)
+-  Sensor integration pending (hardware)
 
 **Server Running:**
 - URL: http://0.0.0.0:8000

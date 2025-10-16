@@ -1,22 +1,273 @@
+import asyncio
+import csv
+import hashlib
+import os
+import statistics
+import time
+import asyncio
+import uuid
+from datetime import datetime
+from typing import Dict, List, Optional
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional, Dict
-from datetime import datetime
-import asyncio
-import time
-import hashlib
-import uuid
-import os
+
+
+import logging
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('/tmp/bin_api.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+MOCK = 0
+TRIG = 22
+ECHO = 16
+MAX_DISTANCE = 32.0
+MIN_DISTANCE = 18.0
+TIMEOUT = 0.02  # 20 ms timeout
+SAMPLE_COUNT = 5
+CURRENT_OCCUPANCY = 0.0
+try:
+    import adafruit_dht
+    import board
+    import lgpio as GPIO
+    import motoron
+    import spidev
+    from adafruit_servokit import ServoKit
+    from gpiozero import DigitalInputDevice
+    logger.info("Hardware libraries imported successfully")
+except ImportError as e:
+    # For environments without hardware access (e.g., testing)
+    # mock it
+    logger.warning(f"Hardware libraries not found: {e}")
+    logger.info("Using mock hardware implementations")
+
+    class ServoKit:
+        class MockServo:
+            def __init__(self, channel):
+                self.channel = channel
+                self._angle = 0
+                self.actuation_range = 180
+                logger.debug(f"Mock Servo created for channel {channel}")
+            
+            @property
+            def angle(self):
+                return self._angle
+            
+            @angle.setter
+            def angle(self, value):
+                logger.debug(f"Mock servo channel {self.channel} set to {value} degrees")
+                self._angle = value
+        
+        def __init__(self, channels):
+            self.channels = channels
+            self.servo = [self.MockServo(i) for i in range(channels)]
+            logger.debug(f"Mock ServoKit initialized with {channels} channels")
+
+        def set_angle(self, channel, angle):
+            logger.debug(f"Mock servo channel {channel} set to {angle} degrees")
+
+    class DigitalInputDevice:
+        def __init__(self, pin):
+            self.pin = pin
+            logger.debug(f"Mock DigitalInputDevice initialized on pin {pin}")
+
+        @property
+        def value(self):
+            return 1  # Not triggered (active low sensor)
+        
+        def is_active(self):
+            return False
+
+    class Motoron:
+        def __init__(self, address):
+            self.address = address
+            logger.debug(f"Mock Motoron initialized with address {address}")
+
+    class GPIO:
+        @staticmethod
+        def setup(pin, mode):
+            logger.debug(f"Mock GPIO setup pin {pin} mode {mode}")
+
+        @staticmethod
+        def output(pin, value):
+            logger.debug(f"Mock GPIO output pin {pin} value {value}")
+
+        @staticmethod
+        def input(pin):
+            return False
+        @staticmethod
+        def gpiochip_open():
+            logger.debug("Mock GPIO chip opened")
+            return None
+        @staticmethod
+        def gpio_claim_output(h, pin):
+            logger.debug(f"Mock GPIO claim output pin {pin}")
+            return None
+        @staticmethod
+        def gpio_claim_input(h, pin):
+            logger.debug(f"Mock GPIO claim input pin {pin}")
+            return None
+        @staticmethod
+        def gpio_read(h, pin):
+            return 0  # Always LOW for mock
+    
+    class board:
+        D17 = None
+    
+    class adafruit_dht:
+        class DHT11:
+            def __init__(self, pin):
+                logger.debug(f"Mock DHT11 initialized on pin {pin}")
+
+            @property
+            def temperature(self):
+                return 25.0
+
+            @property
+            def humidity(self):
+                return 50.0
+    
+    class spidev:
+        class SpiDev:
+            def open(self, bus, device):
+                logger.debug(f"Mock SPI opened bus {bus} device {device}")
+
+            def xfer2(self, data):
+                return [0, 0, 0]
+    
+    MOCK = 1
+
+# Initialize hardware components (real or mock)
+if MOCK == 0:
+    logger.info("Initializing real hardware components")
+    dhtDevice = adafruit_dht.DHT11(board.D17)
+    motor_controller = motoron.Motoron(address=0x58)
+    spi = spidev.SpiDev()
+    spi.open(0, 0)  # Open SPI bus 0, device 0
+    kit = ServoKit(channels=16)
+    controller = GPIO.gpiochip_open()
+    GPIO.gpio_claim_output(controller, TRIG)
+    GPIO.gpio_claim_input(controller, ECHO)
+else:
+    logger.info("Initializing mock hardware components")
+    dhtDevice = adafruit_dht.DHT11(None)
+    motor_controller = Motoron(address=0x58)
+    spi = spidev.SpiDev()
+    spi.open(0, 0)
+    kit = ServoKit(channels=16)
+    controller = GPIO.gpiochip_open()
+    GPIO.gpio_claim_output(controller, TRIG)
+    GPIO.gpio_claim_input(controller, ECHO)
 
 app = FastAPI(
-    title="BLE Mesh Bin API",
+    title="Smart Bin API",
     version="1.0.0",
-    description="REST API for BLE Mesh IoT Bin System"
+    description="REST API for ***BLE*** ***Mesh*** Federated IoT Bin System"
 )
 
-# ============================================================================
-# UNIQUE ID GENERATION
-# ============================================================================
+background_tasks = set()
+async def get_distance():
+    logger.info("Getting distance measurement")
+    GPIO.gpio_write(controller, TRIG, 0)
+    await asyncio.sleep(0.002)
+    GPIO.gpio_write(controller, TRIG, 1)
+    await asyncio.sleep(0.00001)
+    time_start = time.time()
+    while GPIO.gpio_read(controller, ECHO) == 0:
+        pulse_start = time.time()
+        if time.time() - time_start > TIMEOUT:
+            logger.warning("Timeout waiting for ECHO HIGH")
+            return None
+    while GPIO.gpio_read(controller, ECHO) == 1:
+        pulse_end = time.time()
+        if time.time() - time_start > TIMEOUT:
+            logger.warning("Timeout waiting for ECHO LOW")
+            return None
+    duration = pulse_end - pulse_start
+    distance = duration * 17150  # Calculate distance in cm
+    if distance < MIN_DISTANCE or distance > MAX_DISTANCE:
+        logger.warning(f"Distance out of range: {distance} cm")
+        return None
+    return round(distance, 2)
+
+async def get_median_distance(samples=SAMPLE_COUNT):
+    readings = []
+    for _ in range(samples):
+        dist = await get_distance()
+        if dist is not None:
+            readings.append(dist)
+        await asyncio.sleep(0.05)  # Small delay between samples
+    if not readings:
+        logger.warning("No valid distance readings obtained")
+        return None
+    median_dist = statistics.median(readings)
+    logger.info(f"Median distance from {samples} samples: {median_dist} cm")
+    return round(median_dist, 2)
+async def compute_occupancy(distance):
+    if distance is None:
+        return None
+    if distance > MAX_DISTANCE:
+        distance = MAX_DISTANCE
+    if distance < MIN_DISTANCE:
+        distance = MIN_DISTANCE
+    occupancy = ((MAX_DISTANCE - distance) / (MAX_DISTANCE - MIN_DISTANCE)) * 100 # not the same as Cleo's
+    return round(occupancy, 2)
+
+
+async def occupancy_monitoring_task():
+    logging.info("Occupancy monitoring task started")
+    background_tasks.add(asyncio.current_task())
+    while True:
+        distance = await get_median_distance()
+        if distance is not None:
+            occupancy = await compute_occupancy(distance)
+            logging.info(f"Current occupancy: {occupancy}%")
+            global CURRENT_OCCUPANCY
+            CURRENT_OCCUPANCY = occupancy
+    await asyncio.sleep(300)  # Check every 5 minutes
+    background_tasks.remove(asyncio.current_task())
+
+async def lid_control_task():
+    # Control lid using servo on channel 10
+    background_tasks.add(asyncio.current_task())
+    servo = kit.servo[10]
+    servo.actuation_range = 180
+    sensor = DigitalInputDevice(26)
+    logging.info("Lid control task started")
+    while True:
+        if sensor.value == 0:
+            logging.info("Sensor triggered! Opening lid...")
+            servo.angle = 180
+            await asyncio.sleep(5)
+            logging.info("Closing lid...")
+            servo.angle = 0
+            await asyncio.sleep(1)  # Debounce
+        else:
+            servo.angle = 0
+        await asyncio.sleep(0.1)
+       
+    background_tasks.remove(asyncio.current_task())
+
+async def open_door():
+    # Open the door using servo on channel 11
+    logging.info("Door open task started")
+    background_tasks.add(asyncio.current_task())
+    servo = kit.servo[11]
+    servo.actuation_range = 180
+    for angle in range(0, 181, 10):
+        servo.angle = angle
+        await asyncio.sleep(0.05)
+    for angle in range(180, -1, -10):
+        servo.angle = angle
+        await asyncio.sleep(0.05)
+    background_tasks.remove(asyncio.current_task())
 
 def get_hardware_id():
     """
@@ -27,7 +278,6 @@ def get_hardware_id():
     2. MAC address of first network interface
     3. Fallback to generated UUID (saved to file)
     """
-    # Try to get RPi serial number
     try:
         with open('/proc/cpuinfo', 'r') as f:
             for line in f:
@@ -38,7 +288,6 @@ def get_hardware_id():
     except:
         pass
     
-    # Try to get MAC address
     try:
         mac = ':'.join(['{:02x}'.format((uuid.getnode() >> elements) & 0xff)
                        for elements in range(0,2*6,2)][::-1])
@@ -47,8 +296,7 @@ def get_hardware_id():
             return mac.replace(':', '')[-6:]
     except:
         pass
-    
-    # Fallback: generate and save UUID
+
     id_file = '/tmp/bin_hardware_id'
     if os.path.exists(id_file):
         with open(id_file, 'r') as f:
@@ -197,12 +445,16 @@ async def startup_event():
     On startup, check for other nodes.
     If none found, become master.
     """
-    print(f"Starting {node_state['bin_id']}...")
-    print(f"Cluster: {node_state['cluster_id']}")
-    
-    # Start discovery in background
+    logging.info(f"Starting {node_state['bin_id']}...")
+    logging.info(f"Cluster: {node_state['cluster_id']}")
+
+    # Start periodic tasks in background
     asyncio.create_task(periodic_discovery())
+    asyncio.create_task(lid_control_task())
+    asyncio.create_task(occupancy_monitoring_task())
+    #TODO implement a task to raise an event when the bin is full or about to be full
     
+
     # Initial check
     await asyncio.sleep(2)  # Brief wait on startup
     if len(node_state["discovered_nodes"]) == 0:
@@ -456,20 +708,8 @@ async def unregister_node(bin_id: str):
 async def get_occupancy():
     """
     Get garbage bin fill level as a percentage.
-    
-    TODO: Hardware integration pending
-    - Connect to ultrasonic/IR sensor
-    - Calculate distance to waste
-    - Convert to percentage (0-100%)
-    
-    Example implementation:
-        sensor_distance = read_ultrasonic_sensor()
-        bin_depth = 100  # cm
-        occupancy = ((bin_depth - sensor_distance) / bin_depth) * 100
-        return {"occupancy_percentage": occupancy}
     """
-    # Mock data until hardware ready
-    return {"occupancy_percentage": 45.5, "status": "mock"}
+    return {"occupancy_percentage": CURRENT_OCCUPANCY}
 
 
 @app.get("/api/v1/battery")
@@ -527,23 +767,79 @@ async def motor_stop():
         return {"status": "stopped"}
     """
     return {"status": "mock", "message": "Would stop motor"}
+@app.post("/api/v1/door/open")
+async def door_open():
+    """
+    Command to open the door.
+    
+    TODO: Hardware integration pending
+    - Interface with door actuator
+    - Implement safety checks
+    
+    Example implementation:
+        await door_controller.open()
+        return {"status": "opened"}
+    """
+    retval = {}
+    if MOCK:
+        retval = { "message": "Would open door"}
+    else:
 
+        retval = { "message": "Door opened"}
+    
+    task = asyncio.create_task(open_door())
+    return retval
 
-@app.get("/api/v1/temperature")
+@app.post("/api/v1/door/close")
+async def door_close():
+    """
+    Command to close the door.
+
+    TODO: Hardware integration pending
+    - Interface with door actuator
+    - Implement safety checks
+
+    Example implementation:
+        await door_controller.close()
+        return {"status": "closed"}
+    """
+    return {"status": "mock", "message": "Would close door"}
+
+@app.get("/api/v1/environment/temperature")
 async def get_temperature():
     """
     Get internal temperature sensor reading.
-    
-    TODO: Hardware integration pending
-    - Read from DHT22/BME280 sensor
-    - Return celsius value
-    
-    Example implementation:
-        temp_c = read_temperature_sensor()
-        return {"temperature_celsius": temp_c}
     """
-    return {"temperature_celsius": 22.5, "status": "mock"}
+    retval = {}
+    if MOCK:
+        retval = {"temperature_celsius": 22.5}
+    else:
+        retval = {"temperature_celsius": dhtDevice.temp_c}
+    return retval
 
+@app.get("/api/v1/environment/humidity")
+async def get_humidity():
+    """
+    Get internal humidity sensor reading.
+    """
+    retval = {}
+    if MOCK:
+        retval = {"humidity_relative": 55.0}
+    else:
+        retval = {"humidity_relative": dhtDevice.humidity}
+    return retval
+
+@app.get("/api/v1/environment")
+async def get_environment():
+    """
+    Get internal sensor reading of the environment.
+    """
+    retval = {}
+    if MOCK:
+        retval = {"temperature_celsius": 22.5, "humidity_relative": 55.0}
+    else:
+        retval = {"temperature_celsius": dhtDevice.temp_c, "humidity_relative": dhtDevice.humidity}
+    return retval
 
 @app.get("/api/v1/signal-strength")
 async def get_signal_strength():
@@ -558,7 +854,12 @@ async def get_signal_strength():
         rssi = get_ble_rssi_to_master()
         return {"rssi": rssi}
     """
-    return {"rssi": -65, "status": "mock"}
+    retval = {}
+    if MOCK:
+        retval = {"rssi": -65, "status": "mock"}
+    else:
+        retval = {"rssi": get_ble_rssi_to_master(), "status": "deployed"}
+    return retval
 
 
 # ============================================================================

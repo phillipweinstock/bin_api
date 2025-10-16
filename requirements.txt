@@ -1,4 +1,14 @@
+# Core API dependencies
 fastapi
 uvicorn[standard]
 pydantic
 python-multipart
+
+# Hardware libraries (Mandatory for actual hardware, mocking for development only)
+# These will fail gracefully on non-Raspberry Pi systems
+adafruit-circuitpython-servokit; platform_machine == "aarch64" or platform_machine == "armv7l"
+gpiozero; platform_machine == "aarch64" or platform_machine == "armv7l"
+motoron; platform_machine == "aarch64" or platform_machine == "armv7l"
+lgpio; platform_machine == "aarch64" or platform_machine == "armv7l"
+adafruit-circuitpython-dht; platform_machine == "aarch64" or platform_machine == "armv7l"
+spidev; platform_machine == "aarch64" or platform_machine == "armv7l"
