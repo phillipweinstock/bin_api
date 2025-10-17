@@ -315,42 +315,58 @@ async def compute_occupancy(distance):
 async def occupancy_monitoring_task():
     logging.info("Occupancy monitoring task started")
     background_tasks.add(asyncio.current_task())
-    while True:
-        distance = await get_median_distance()
-        if distance is not None:
-            occupancy = await compute_occupancy(distance)
-            logging.info(f"Current occupancy: {occupancy}%")
-            global CURRENT_OCCUPANCY
-            CURRENT_OCCUPANCY = occupancy
-        await asyncio.sleep(300)  # Check every 5 minutes
-    background_tasks.remove(asyncio.current_task())
+    try:
+        while True:
+            try:
+                distance = await get_median_distance()
+                if distance is not None:
+                    occupancy = await compute_occupancy(distance)
+                    logging.info(f"Current occupancy: {occupancy}%")
+                    global CURRENT_OCCUPANCY
+                    CURRENT_OCCUPANCY = occupancy
+            except asyncio.CancelledError:
+                logger.info("Occupancy monitoring task cancelled, shutting down")
+                raise
+            except Exception as e:
+                logger.error(f"Error in occupancy monitoring task: {e}")
+            await asyncio.sleep(300)  # Check every 5 minutes
+    finally:
+        background_tasks.remove(asyncio.current_task())
 
 
 async def lid_control_task():
     # Control lid using servo on channel 10
     background_tasks.add(asyncio.current_task())
-    servo = kit.servo[10]
-    servo.actuation_range = 180
-    sensor = DigitalInputDevice(26)
-    logging.info("Lid control task started")
-    while True:
-        if LID_LOCKED:
-            servo.angle = 0
-            logging.info("Lid is locked. Keeping closed.")
-            await asyncio.sleep(0.5)
-            continue
-        if sensor.value == 0:
-            logging.info("Sensor triggered! Opening lid...")
-            servo.angle = 180
-            await asyncio.sleep(5)
-            logging.info("Closing lid...")
-            servo.angle = 0
-            await asyncio.sleep(1)  # Debounce
-        else:
-            servo.angle = 0
-        await asyncio.sleep(0.1)
-
-    background_tasks.remove(asyncio.current_task())
+    try:
+        servo = kit.servo[10]
+        servo.actuation_range = 180
+        sensor = DigitalInputDevice(26)
+        logging.info("Lid control task started")
+        while True:
+            try:
+                if LID_LOCKED:
+                    servo.angle = 0
+                    logging.info("Lid is locked. Keeping closed.")
+                    await asyncio.sleep(0.5)
+                    continue
+                if sensor.value == 0:
+                    logging.info("Sensor triggered! Opening lid...")
+                    servo.angle = 180
+                    await asyncio.sleep(5)
+                    logging.info("Closing lid...")
+                    servo.angle = 0
+                    await asyncio.sleep(1)  # Debounce
+                else:
+                    servo.angle = 0
+                await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                logger.info("Lid control task cancelled, shutting down")
+                raise
+            except Exception as e:
+                logger.error(f"Error in lid control task: {e}")
+                await asyncio.sleep(1)  # Brief pause before retry
+    finally:
+        background_tasks.remove(asyncio.current_task())
 
 
 async def open_door():
@@ -623,6 +639,10 @@ async def periodic_telemetry():
                 
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to send telemetry to {WEBHOOK}: {e}")
+        except asyncio.CancelledError:
+            # Task is being cancelled (shutdown), re-raise to stop gracefully
+            logger.info("Telemetry task cancelled, shutting down")
+            raise
         except Exception as e:
             logger.error(f"Error in telemetry task: {e}")
         
@@ -635,9 +655,19 @@ async def periodic_discovery():
     Periodically check for nodes and clean up stale entries.
     Runs in background.
     """
-    while True:
-        await check_for_other_nodes()
-        await asyncio.sleep(30)  # Check every 30 seconds
+    background_tasks.add(asyncio.current_task())
+    try:
+        while True:
+            try:
+                await check_for_other_nodes()
+            except asyncio.CancelledError:
+                logger.info("Discovery task cancelled, shutting down")
+                raise
+            except Exception as e:
+                logger.error(f"Error in discovery task: {e}")
+            await asyncio.sleep(30)  # Check every 30 seconds
+    finally:
+        background_tasks.remove(asyncio.current_task())
 
 
 @app.on_event("startup")
