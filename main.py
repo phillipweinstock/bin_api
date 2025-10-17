@@ -7,16 +7,23 @@ import statistics
 import time
 import uuid
 import subprocess
+import platform
 from datetime import datetime
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+if platform.system() == "Windows":
+    log_file_path = "C:/temp/bin_api.log"
+    os.makedirs("C:/temp", exist_ok=True)
+else:
+    log_file_path = "/tmp/bin_api.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s - %(asctime)s - %(name)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("/tmp/bin_api.log")],
+    handlers=[logging.StreamHandler(), logging.FileHandler(log_file_path)],
 )
 logger = logging.getLogger(__name__)
 __VERSION__ = "1.0.0"
@@ -30,6 +37,7 @@ TIMEOUT = 0.02  # 20 ms timeout
 SAMPLE_COUNT = 5
 CURRENT_OCCUPANCY = 0.0
 MANUAL_CLUSTER_RENAME = False
+LID_LOCKED = False
 try:
     import adafruit_dht
     import board
@@ -318,6 +326,11 @@ async def lid_control_task():
     sensor = DigitalInputDevice(26)
     logging.info("Lid control task started")
     while True:
+        if LID_LOCKED:
+            servo.angle = 0
+            logging.info("Lid is locked. Keeping closed.")
+            await asyncio.sleep(0.5)
+            continue
         if sensor.value == 0:
             logging.info("Sensor triggered! Opening lid...")
             servo.angle = 180
@@ -967,8 +980,6 @@ async def root():
 async def health_check():
     return {"status": "healthy"}
 
-
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
