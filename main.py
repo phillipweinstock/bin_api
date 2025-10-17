@@ -170,6 +170,9 @@ except ImportError as e:
             @property
             def temperature(self):
                 return 25.0
+            @property
+            def temp_c(self):
+                return 25.0
 
             @property
             def humidity(self):
@@ -207,7 +210,7 @@ except ImportError as e:
 if MOCK == 0:
     logger.info("Initializing real hardware components")
     dhtDevice = adafruit_dht.DHT11(board.D17)
-    motor_controller = motoron.Motoron(address=0x58)
+    motor_controller = motoron.MotoronI2C(address=0x58)
     spi = spidev.SpiDev()
     spi.open(0, 0)  # Open SPI bus 0, device 0
     kit = ServoKit(channels=16)
@@ -540,7 +543,11 @@ async def periodic_telemetry():
     Periodically send telemetry data to the frontend server.
     Sends this node's data plus all connected slaves' data.
     """
+    background_tasks.add(asyncio.current_task())
     while True:
+        # if node_state["is_master"] is None:
+        #     await asyncio.sleep(10)
+        #     continue
         try:
             # Collect this node's telemetry
             current_temp = dhtDevice.temperature if MOCK == 0 else 25.0
@@ -604,6 +611,7 @@ async def periodic_telemetry():
                 logger.info(f"Telemetry sent successfully to {WEBHOOK}")
             else:
                 logger.warning(f"Telemetry failed with status {response.status_code}: {response.text}")
+            background_tasks.remove(asyncio.current_task())
                 
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to send telemetry to {WEBHOOK}: {e}")
@@ -715,14 +723,14 @@ class MasterStatus(BaseModel):
     last_election: Optional[datetime]
 
 
-@app.post("/api/v1/telemetry")
-async def post_telemetry(data: List[Telemetry]):
-    """
-    Receive telemetry from master node or aggregated from slaves.
-    Master nodes collect data from slaves via BLE mesh and push here.
-    """
-    telemetry_buffer.extend([t.dict() for t in data])
-    return {"status": "accepted", "received": len(data)}
+# @app.post("/api/v1/telemetry")
+# async def post_telemetry(data: List[Telemetry]):
+#     """
+#     Receive telemetry from master node or aggregated from slaves.
+#     Master nodes collect data from slaves via BLE mesh and push here.
+#     """
+#     telemetry_buffer.extend([t.dict() for t in data])
+#     return {"status": "accepted", "received": len(data)}
 
 
 @app.get("/api/v1/commands/{bin_id}")
@@ -923,7 +931,7 @@ async def get_battery():
         return {"battery_percentage": battery_pct}
     """
     # Mock data until hardware ready
-    return {"battery_percentage": 87.3, "status": "mock"}
+    return {"battery_percentage": 87.3, "status": "mock-this would be replaced with a battery status reading"}
 
 
 @app.post("/api/v1/motor/dock")
@@ -1028,11 +1036,11 @@ async def get_environment():
     """
     Get internal sensor reading of the environment.
     """
-    retval = {}
-    if MOCK:
-        retval = {"temperature_celsius": 22.5, "humidity_relative": 55.0}
-    else:
-        retval = {
+    # retval = {}
+    # if MOCK:
+    #     retval = {"temperature_celsius": 22.5, "humidity_relative": 55.0}
+    # else:
+    retval = {
             "temperature_celsius": dhtDevice.temp_c,
             "humidity_relative": dhtDevice.humidity,
         }
