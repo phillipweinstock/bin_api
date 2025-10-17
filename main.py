@@ -338,30 +338,16 @@ async def occupancy_monitoring_task():
 async def lid_control_task():
     """
     Control lid using servo on channel 10.
-    Uses lgpio for sensor reading to avoid conflicts with gpiozero.
+    Uses gpiozero for sensor reading (same as original working code).
     """
     background_tasks.add(asyncio.current_task())
-    lid_sensor_handle = None
     
     try:
         servo = kit.servo[10]
         servo.actuation_range = 180
         
-        # Initialize lid sensor using lgpio (same as ultrasonic sensor)
-        if MOCK == 0:
-            # Claim the lid sensor pin as input
-            try:
-                GPIO.gpio_free(controller, LID_SENSOR)
-                logger.debug(f"Freed GPIO pin {LID_SENSOR}")
-            except Exception as e:
-                logger.debug(f"GPIO pin {LID_SENSOR} was not claimed: {e}")
-            
-            try:
-                GPIO.gpio_claim_input(controller, LID_SENSOR)
-                logger.info(f"Claimed GPIO pin {LID_SENSOR} as input (LID_SENSOR)")
-            except Exception as e:
-                logger.error(f"Failed to claim GPIO pin {LID_SENSOR}: {e}")
-                raise
+        # Use gpiozero DigitalInputDevice like the original working code
+        sensor = DigitalInputDevice(LID_SENSOR)
         
         logging.info("Lid control task started")
         last_sensor_state = None
@@ -374,8 +360,8 @@ async def lid_control_task():
                     await asyncio.sleep(0.5)
                     continue
                 
-                # Read sensor using lgpio (active low - 0 = triggered)
-                sensor_value = GPIO.gpio_read(controller, LID_SENSOR) if MOCK == 0 else 1
+                # Read sensor using gpiozero (active low - 0 = triggered)
+                sensor_value = sensor.value
                 
                 # Log sensor state changes for debugging
                 if sensor_value != last_sensor_state:
@@ -400,13 +386,6 @@ async def lid_control_task():
                 logger.error(f"Error in lid control task: {e}")
                 await asyncio.sleep(1)  # Brief pause before retry
     finally:
-        # Clean up lid sensor GPIO
-        if MOCK == 0 and controller is not None:
-            try:
-                GPIO.gpio_free(controller, LID_SENSOR)
-                logger.info(f"Freed lid sensor GPIO pin {LID_SENSOR}")
-            except Exception as e:
-                logger.debug(f"Error freeing lid sensor pin: {e}")
         background_tasks.remove(asyncio.current_task())
 
 
@@ -791,12 +770,7 @@ async def shutdown_event():
             logger.info("Cleaning up GPIO pins...")
             GPIO.gpio_free(controller, TRIG)
             GPIO.gpio_free(controller, ECHO)
-            # Note: LID_SENSOR is cleaned up in lid_control_task's finally block
-            # but we'll try here too in case of unexpected shutdown
-            try:
-                GPIO.gpio_free(controller, LID_SENSOR)
-            except Exception:
-                pass  # Already freed or never claimed
+            # Note: LID_SENSOR uses gpiozero and cleans up automatically
             GPIO.gpiochip_close(controller)
             logger.info("GPIO cleanup complete")
         except Exception as e:
@@ -1066,13 +1040,11 @@ async def get_lid_status():
     """
     Get current lid sensor status and lock state.
     Useful for debugging lid control task.
-    Uses lgpio for consistency with other GPIO operations.
+    Uses gpiozero (same as original working code).
     """
     try:
-        if MOCK == 0 and controller is not None:
-            sensor_value = GPIO.gpio_read(controller, LID_SENSOR)
-        else:
-            sensor_value = 1  # Mock: not triggered
+        sensor = DigitalInputDevice(LID_SENSOR)
+        sensor_value = sensor.value
     except Exception as e:
         sensor_value = f"error: {e}"
     
@@ -1082,7 +1054,7 @@ async def get_lid_status():
         "sensor_value": sensor_value,
         "sensor_triggered": sensor_value == 0 if isinstance(sensor_value, int) else False,
         "note": "sensor_value=0 means triggered (active low)",
-        "gpio_library": "lgpio"
+        "gpio_library": "gpiozero"
     }
 
 
