@@ -547,10 +547,11 @@ async def periodic_telemetry():
     Sends this node's data plus all connected slaves' data.
     """
     background_tasks.add(asyncio.current_task())
+    
+    # Wait before first telemetry send to avoid blocking startup
+    await asyncio.sleep(10)
+    
     while True:
-        # if node_state["is_master"] is None:
-        #     await asyncio.sleep(10)
-        #     continue
         try:
             # Collect this node's telemetry
             current_temp = dhtDevice.temperature if MOCK == 0 else 25.0
@@ -608,13 +609,17 @@ async def periodic_telemetry():
             logger.info(f"Sending telemetry for cluster {node_state['cluster_id']}: " +
                        f"{len(telemetry_payload['slave_nodes']) + 1} nodes")
             
-            response = requests.post(WEBHOOK, json=telemetry_payload, timeout=10)
+            # Run the blocking request in a thread pool to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, 
+                lambda: requests.post(WEBHOOK, json=telemetry_payload, timeout=10)
+            )
             
             if response.status_code == 200:
                 logger.info(f"Telemetry sent successfully to {WEBHOOK}")
             else:
                 logger.warning(f"Telemetry failed with status {response.status_code}: {response.text}")
-            background_tasks.remove(asyncio.current_task())
                 
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to send telemetry to {WEBHOOK}: {e}")
@@ -622,6 +627,8 @@ async def periodic_telemetry():
             logger.error(f"Error in telemetry task: {e}")
         
         await asyncio.sleep(300)  # Every 5 minutes
+    
+    background_tasks.remove(asyncio.current_task())
 
 async def periodic_discovery():
     """
