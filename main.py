@@ -1,3 +1,4 @@
+import requests
 import asyncio
 import csv
 import hashlib
@@ -38,6 +39,7 @@ SAMPLE_COUNT = 5
 CURRENT_OCCUPANCY = 0.0
 MANUAL_CLUSTER_RENAME = False
 LID_LOCKED = False
+WEBHOOK = "http://172.26.59.116:3000/api/bin-status"
 try:
     import adafruit_dht
     import board
@@ -533,6 +535,82 @@ async def check_for_other_nodes():
             node_state["master_id"] = None
             node_state["last_election"] = datetime.utcnow()
 
+async def periodic_telemetry():
+    """
+    Periodically send telemetry data to the frontend server.
+    Sends this node's data plus all connected slaves' data.
+    """
+    while True:
+        try:
+            # Collect this node's telemetry
+            current_temp = dhtDevice.temperature if MOCK == 0 else 25.0
+            current_humidity = dhtDevice.humidity if MOCK == 0 else 50.0
+            
+            this_node_telemetry = {
+                "bin_id": node_state["bin_id"],
+                "timestamp": datetime.utcnow().isoformat(),
+                "fill_level": CURRENT_OCCUPANCY,
+                "battery": 100.0,  # TODO: Replace with actual battery reading
+                "signal_strength": -50,  # TODO: Replace with actual RSSI
+                "temperature": current_temp,
+                "humidity": current_humidity,
+                "is_master": node_state["is_master"],
+                "master_id": node_state["master_id"],
+                "cluster_id": node_state["cluster_id"],
+               # "location": "Warehouse A",  # TODO: Make configurable
+            }
+            
+            # Prepare telemetry payload
+            telemetry_payload = {
+                "master_node": this_node_telemetry,
+                "slave_nodes": [],
+                "cluster_summary": {
+                    "cluster_id": node_state["cluster_id"],
+                    "total_nodes": len(node_state["slaves"]) + 1,
+                    "master_id": node_state["bin_id"],
+                    "slave_ids": node_state["slaves"],
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            }
+            
+            # Add slave telemetry if we're master
+            # TODO:  this will be aggregated from BLE mesh TELEMETRY messages
+            if node_state["is_master"] and node_state["slaves"]:
+                logger.info(f"Collecting telemetry from {len(node_state['slaves'])} slaves")
+                for slave_id in node_state["slaves"]:
+                    # Mock slave data for now - will be replaced with actual BLE mesh data
+                    slave_telemetry = {
+                        "bin_id": slave_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "fill_level": 50.0,  # Mock data
+                        "battery": 85.0,  # Mock data
+                        "signal_strength": -60,  # Mock data
+                        "temperature": 24.0,  # Mock data
+                        "humidity": 48.0,  # Mock data
+                        "is_master": False,
+                        "master_id": node_state["bin_id"],
+                        "cluster_id": node_state["cluster_id"],
+                        #"location": f"Warehouse A - Slave",  # Mock data
+                    }
+                    telemetry_payload["slave_nodes"].append(slave_telemetry)
+            
+            # Send to webhook endpoint
+            logger.info(f"Sending telemetry for cluster {node_state['cluster_id']}: " +
+                       f"{len(telemetry_payload['slave_nodes']) + 1} nodes")
+            
+            response = requests.post(WEBHOOK, json=telemetry_payload, timeout=10)
+            
+            if response.status_code == 200:
+                logger.info(f"Telemetry sent successfully to {WEBHOOK}")
+            else:
+                logger.warning(f"Telemetry failed with status {response.status_code}: {response.text}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to send telemetry to {WEBHOOK}: {e}")
+        except Exception as e:
+            logger.error(f"Error in telemetry task: {e}")
+        
+        await asyncio.sleep(300)  # Every 5 minutes
 
 async def periodic_discovery():
     """
@@ -558,6 +636,7 @@ async def startup_event():
 
     # Start periodic tasks in background
     asyncio.create_task(periodic_discovery())
+    asyncio.create_task(periodic_telemetry())
     asyncio.create_task(lid_control_task())
     asyncio.create_task(occupancy_monitoring_task())
     # TODO implement a task to raise an event when the bin is full or about to be full
@@ -581,9 +660,26 @@ class Telemetry(BaseModel):
     battery: float
     signal_strength: Optional[int] = None
     temperature: Optional[float] = None
+    humidity: Optional[float] = None
     is_master: bool
     master_id: Optional[str] = None
-    location: Optional[str] = None
+    cluster_id: Optional[str] = None
+    #location: Optional[str] = None
+
+
+class ClusterSummary(BaseModel):
+    cluster_id: str
+    total_nodes: int
+    master_id: str
+    slave_ids: List[str]
+    timestamp: str
+
+
+class TelemetryPayload(BaseModel):
+    """Comprehensive telemetry payload including master and all slaves"""
+    master_node: Telemetry
+    slave_nodes: List[Telemetry]
+    cluster_summary: ClusterSummary
 
 
 class Command(BaseModel):
@@ -979,6 +1075,63 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/api/v1/telemetry/preview")
+async def preview_telemetry():
+    """
+    Preview the telemetry payload that will be sent to the webhook.
+    Useful for debugging and monitoring.
+    """
+    current_temp = dhtDevice.temperature if MOCK == 0 else 25.0
+    current_humidity = dhtDevice.humidity if MOCK == 0 else 50.0
+    
+    this_node_telemetry = {
+        "bin_id": node_state["bin_id"],
+        "timestamp": datetime.utcnow().isoformat(),
+        "fill_level": CURRENT_OCCUPANCY,
+        "battery": 100.0,
+        "signal_strength": -50,
+        "temperature": current_temp,
+        "humidity": current_humidity,
+        "is_master": node_state["is_master"],
+        "master_id": node_state["master_id"],
+        "cluster_id": node_state["cluster_id"],
+        "location": "Warehouse A",
+    }
+    
+    telemetry_payload = {
+        "master_node": this_node_telemetry,
+        "slave_nodes": [],
+        "cluster_summary": {
+            "cluster_id": node_state["cluster_id"],
+            "total_nodes": len(node_state["slaves"]) + 1,
+            "master_id": node_state["bin_id"],
+            "slave_ids": node_state["slaves"],
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    }
+    
+    # Add slave telemetry if we're master
+    if node_state["is_master"] and node_state["slaves"]:
+        for slave_id in node_state["slaves"]:
+            slave_telemetry = {
+                "bin_id": slave_id,
+                "timestamp": datetime.utcnow().isoformat(),
+                "fill_level": 50.0,
+                "battery": 85.0,
+                "signal_strength": -60,
+                "temperature": 24.0,
+                "humidity": 48.0,
+                "is_master": False,
+                "master_id": node_state["bin_id"],
+                "cluster_id": node_state["cluster_id"],
+                "location": f"Warehouse A - Slave",
+            }
+            telemetry_payload["slave_nodes"].append(slave_telemetry)
+    
+    return telemetry_payload
+
 
 if __name__ == "__main__":
     import uvicorn

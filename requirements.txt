@@ -3,6 +3,7 @@ fastapi
 uvicorn[standard]
 pydantic
 python-multipart
+requests
 
 # Hardware libraries (Mandatory for actual hardware, mocking for development only)
 # These will fail gracefully on non-Raspberry Pi systems
