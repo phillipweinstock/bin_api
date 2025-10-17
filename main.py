@@ -1209,4 +1209,4 @@ if __name__ == "__main__":
     #use_reload = MOCK == 1  # Only use reload in mock/development mode
     #if not use_reload:
         #logger.info("Running on real hardware - auto-reload disabled")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=use_reload)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)#use_reload)
