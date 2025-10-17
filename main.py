@@ -1,30 +1,26 @@
 import asyncio
 import csv
 import hashlib
+import logging
 import os
 import statistics
 import time
-import asyncio
 import uuid
+import subprocess
 from datetime import datetime
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-
-import logging
-
-
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('/tmp/bin_api.log')
-    ]
+    format="%(levelname)s - %(asctime)s - %(name)s - %(message)s",
+    handlers=[logging.StreamHandler(), logging.FileHandler("/tmp/bin_api.log")],
 )
 logger = logging.getLogger(__name__)
+__VERSION__ = "1.0.0"
+logger.info(f"Starting Smart Bin API v{__VERSION__}")
 MOCK = 0
 TRIG = 22
 ECHO = 16
@@ -33,6 +29,7 @@ MIN_DISTANCE = 18.0
 TIMEOUT = 0.02  # 20 ms timeout
 SAMPLE_COUNT = 5
 CURRENT_OCCUPANCY = 0.0
+MANUAL_CLUSTER_RENAME = False
 try:
     import adafruit_dht
     import board
@@ -40,7 +37,9 @@ try:
     import motoron
     import spidev
     from adafruit_servokit import ServoKit
+    from dbus_next.aio import MessageBus
     from gpiozero import DigitalInputDevice
+
     logger.info("Hardware libraries imported successfully")
 except ImportError as e:
     # For environments without hardware access (e.g., testing)
@@ -55,16 +54,18 @@ except ImportError as e:
                 self._angle = 0
                 self.actuation_range = 180
                 logger.debug(f"Mock Servo created for channel {channel}")
-            
+
             @property
             def angle(self):
                 return self._angle
-            
+
             @angle.setter
             def angle(self, value):
-                logger.debug(f"Mock servo channel {self.channel} set to {value} degrees")
+                logger.debug(
+                    f"Mock servo channel {self.channel} set to {value} degrees"
+                )
                 self._angle = value
-        
+
         def __init__(self, channels):
             self.channels = channels
             self.servo = [self.MockServo(i) for i in range(channels)]
@@ -81,7 +82,7 @@ except ImportError as e:
         @property
         def value(self):
             return 1  # Not triggered (active low sensor)
-        
+
         def is_active(self):
             return False
 
@@ -91,6 +92,9 @@ except ImportError as e:
             logger.debug(f"Mock Motoron initialized with address {address}")
 
     class GPIO:
+        _pin_states = {}  # Track pin states for mock behavior
+        _read_count = {}  # Track how many times a pin has been read
+
         @staticmethod
         def setup(pin, mode):
             logger.debug(f"Mock GPIO setup pin {pin} mode {mode}")
@@ -102,25 +106,52 @@ except ImportError as e:
         @staticmethod
         def input(pin):
             return False
+
         @staticmethod
         def gpiochip_open():
             logger.debug("Mock GPIO chip opened")
             return None
+
         @staticmethod
         def gpio_claim_output(h, pin):
             logger.debug(f"Mock GPIO claim output pin {pin}")
+            GPIO._pin_states[pin] = 0
             return None
+
         @staticmethod
         def gpio_claim_input(h, pin):
             logger.debug(f"Mock GPIO claim input pin {pin}")
+            GPIO._pin_states[pin] = GPIO._read_count[pin] = 0
             return None
+
+        @staticmethod
+        def gpio_write(h, pin, value):
+            logger.debug(f"Mock GPIO write pin {pin} value {value}")
+            GPIO._pin_states[pin] = value
+
         @staticmethod
         def gpio_read(h, pin):
-            return 0  # Always LOW for mock
-    
+            # Simulate ultrasonic sensor behavior
+            # First few reads return 0 (waiting for pulse)
+            if pin not in GPIO._read_count:
+                GPIO._read_count[pin] = 0
+
+            GPIO._read_count[pin] += 1
+            count = GPIO._read_count[pin]
+            retval = 0
+            match count:
+                case 1 | 2:
+                    retval = 0
+                case 3 | 4 | 5:
+                    retval = 1
+                case _:
+                    GPIO._read_count[pin] = 0
+                    retval = 0
+            return retval
+
     class board:
         D17 = None
-    
+
     class adafruit_dht:
         class DHT11:
             def __init__(self, pin):
@@ -133,7 +164,7 @@ except ImportError as e:
             @property
             def humidity(self):
                 return 50.0
-    
+
     class spidev:
         class SpiDev:
             def open(self, bus, device):
@@ -141,7 +172,25 @@ except ImportError as e:
 
             def xfer2(self, data):
                 return [0, 0, 0]
-    
+    class WifiController:
+        def __init__(self,interface='wlan0'):
+            logger.debug("Mock WifiController initialized")
+
+        def run(self,*cmd):
+            logger.debug(f"Mock WifiController run command: {' '.join(cmd)}")
+            return "Mocked subprocess output"
+        def enable(self):
+            logger.debug("Mock WifiController enable called")
+            self.run("rfkill","unblock","wifi")
+        def disable(self):
+            logger.debug("Mock WifiController disable called")
+            self.run("rfkill","block","wifi")
+        def is_enabled(self):
+            logger.debug("Mock WifiController is_enabled called")
+            return True
+            #sudo setcap cap_net_admin+ep $(which rfkill) must be run to use rfkill without sudo
+            
+
     MOCK = 1
 
 # Initialize hardware components (real or mock)
@@ -155,6 +204,22 @@ if MOCK == 0:
     controller = GPIO.gpiochip_open()
     GPIO.gpio_claim_output(controller, TRIG)
     GPIO.gpio_claim_input(controller, ECHO)
+    class WifiController:
+        def __init__(self,interface='wlan0'):
+            self.interface=interface
+        def run(self,*cmd):
+            result=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            if result.returncode!=0:
+                raise Exception(f"Command {' '.join(cmd)} failed: {result.stderr.strip()}")
+            return result.stdout.strip()
+        def enable(self):
+            self.run("rfkill","unblock","wifi")
+        def disable(self):
+            self.run("rfkill","block","wifi")
+        def is_enabled(self):
+            status=self.run("rfkill","list","wifi")
+            return "Soft blocked: no" in status and "Hard blocked: no" in status
+    wifi = WifiController()
 else:
     logger.info("Initializing mock hardware components")
     dhtDevice = adafruit_dht.DHT11(None)
@@ -165,14 +230,17 @@ else:
     controller = GPIO.gpiochip_open()
     GPIO.gpio_claim_output(controller, TRIG)
     GPIO.gpio_claim_input(controller, ECHO)
+    wifi = WifiController()
 
 app = FastAPI(
     title="Smart Bin API",
-    version="1.0.0",
-    description="REST API for ***BLE*** ***Mesh*** Federated IoT Bin System"
+    version=__VERSION__,
+    description="REST API for ***BLE*** ***Mesh*** Federated IoT Bin System",
 )
 
 background_tasks = set()
+
+
 async def get_distance():
     logger.info("Getting distance measurement")
     GPIO.gpio_write(controller, TRIG, 0)
@@ -195,9 +263,12 @@ async def get_distance():
     if distance < MIN_DISTANCE or distance > MAX_DISTANCE:
         logger.warning(f"Distance out of range: {distance} cm")
         return None
+    logger.info(f"Distance measured: {distance} cm")
     return round(distance, 2)
 
+
 async def get_median_distance(samples=SAMPLE_COUNT):
+    logger.info(f"Getting median distance from {samples} samples")
     readings = []
     for _ in range(samples):
         dist = await get_distance()
@@ -210,6 +281,8 @@ async def get_median_distance(samples=SAMPLE_COUNT):
     median_dist = statistics.median(readings)
     logger.info(f"Median distance from {samples} samples: {median_dist} cm")
     return round(median_dist, 2)
+
+
 async def compute_occupancy(distance):
     if distance is None:
         return None
@@ -217,7 +290,9 @@ async def compute_occupancy(distance):
         distance = MAX_DISTANCE
     if distance < MIN_DISTANCE:
         distance = MIN_DISTANCE
-    occupancy = ((MAX_DISTANCE - distance) / (MAX_DISTANCE - MIN_DISTANCE)) * 100 # not the same as Cleo's
+    occupancy = (
+        (MAX_DISTANCE - distance) / (MAX_DISTANCE - MIN_DISTANCE)
+    ) * 100  # not the same as Cleo's
     return round(occupancy, 2)
 
 
@@ -231,8 +306,9 @@ async def occupancy_monitoring_task():
             logging.info(f"Current occupancy: {occupancy}%")
             global CURRENT_OCCUPANCY
             CURRENT_OCCUPANCY = occupancy
-    await asyncio.sleep(300)  # Check every 5 minutes
+        await asyncio.sleep(300)  # Check every 5 minutes
     background_tasks.remove(asyncio.current_task())
+
 
 async def lid_control_task():
     # Control lid using servo on channel 10
@@ -252,8 +328,9 @@ async def lid_control_task():
         else:
             servo.angle = 0
         await asyncio.sleep(0.1)
-       
+
     background_tasks.remove(asyncio.current_task())
+
 
 async def open_door():
     # Open the door using servo on channel 11
@@ -269,41 +346,53 @@ async def open_door():
         await asyncio.sleep(0.05)
     background_tasks.remove(asyncio.current_task())
 
+
 def get_hardware_id():
     """
     Generate a deterministic unique ID based on hardware.
-    
+
     Priority:
-    1. Raspberry Pi serial number (from /proc/cpuinfo)
+    1. Raspberry Pi serial number (from /proc/cpuinfo), likely need to use some `subprocess` calls i.e cat
     2. MAC address of first network interface
     3. Fallback to generated UUID (saved to file)
     """
+    logger.info("Generating hardware ID")
     try:
-        with open('/proc/cpuinfo', 'r') as f:
+        with open("/proc/cpuinfo", "r") as f:
             for line in f:
-                if line.startswith('Serial'):
-                    serial = line.split(':')[1].strip()
-                    if serial and serial != '0000000000000000':
+                if line.startswith("Serial"):
+                    serial = line.split(":")[1].strip()
+                    if serial and serial != "0000000000000000":
+                        logger.info(
+                            f"Using CPU serial number for hardware ID: {serial[-8:]}"
+                        )
                         return serial[-8:]  # Last 8 chars
     except:
         pass
-    
+
     try:
-        mac = ':'.join(['{:02x}'.format((uuid.getnode() >> elements) & 0xff)
-                       for elements in range(0,2*6,2)][::-1])
-        if mac != '00:00:00:00:00:00':
+        mac = ":".join(
+            [
+                "{:02x}".format((uuid.getnode() >> elements) & 0xFF)
+                for elements in range(0, 2 * 6, 2)
+            ][::-1]
+        )
+        if mac != "00:00:00:00:00:00":
             # Use last 6 chars of MAC (without colons)
-            return mac.replace(':', '')[-6:]
+            logger.info(
+                f"Using MAC address for hardware ID: {mac.replace(':', '')[-6:]}"
+            )
+            return mac.replace(":", "")[-6:]
     except:
         pass
 
-    id_file = '/tmp/bin_hardware_id'
+    id_file = "/tmp/bin_hardware_id"
     if os.path.exists(id_file):
-        with open(id_file, 'r') as f:
+        with open(id_file, "r") as f:
             return f.read().strip()
     else:
         generated_id = str(uuid.uuid4())[:6].upper()
-        with open(id_file, 'w') as f:
+        with open(id_file, "w") as f:
             f.write(generated_id)
         return generated_id
 
@@ -318,24 +407,24 @@ def generate_cluster_id(bin_ids: List[str]):
     """
     Generate cluster ID based on member bin IDs.
     Takes first 2 chars of each bin's hardware ID and hashes them.
-    
+
     Example: BIN-ABC123, BIN-DEF456 -> CLUSTER-A7F2
     """
     if not bin_ids:
         # Solo node - use own ID
         hw_id = get_hardware_id()
         return f"SOLO-{hw_id[:4].upper()}"
-    
+
     # Sort for deterministic ordering
     sorted_ids = sorted(bin_ids)
-    
+
     # Combine the hardware parts
-    combined = ''.join([bid.split('-')[1][:2] for bid in sorted_ids])
-    
+    combined = "".join([bid.split("-")[1][:2] for bid in sorted_ids])
+
     # Hash to get 4-char cluster ID
     hash_obj = hashlib.md5(combined.encode())
     cluster_hash = hash_obj.hexdigest()[:4].upper()
-    
+
     return f"CLUSTER-{cluster_hash}"
 
 
@@ -361,13 +450,8 @@ node_state = {
 DISCOVERY_TIMEOUT = 30  # seconds - if no nodes found, remain master
 HEARTBEAT_TIMEOUT = 60  # seconds - if no heartbeat, node is considered offline
 
-# Command queue: {bin_id: [commands]}
 command_queue: Dict[str, List[dict]] = {}
-
-# Telemetry buffer (in-memory for now)
 telemetry_buffer: List[dict] = []
-
-# Election history
 election_history: List[dict] = []
 
 
@@ -375,20 +459,25 @@ election_history: List[dict] = []
 # DISCOVERY & ELECTION LOGIC
 # ============================================================================
 
+
 def update_cluster_id():
     """
     Regenerate cluster ID based on current members.
     Called when nodes join/leave the cluster.
     """
+    if MANUAL_CLUSTER_RENAME:
+        return node_state["cluster_id"] # we dont really want to rename it if manually set
+        #we should expect that bins joining the cluster to accept the manual name
+
     all_members = [node_state["bin_id"]] + list(node_state["discovered_nodes"].keys())
     new_cluster_id = generate_cluster_id(all_members)
-    
+
     if new_cluster_id != node_state["cluster_id"]:
         old_cluster_id = node_state["cluster_id"]
         node_state["cluster_id"] = new_cluster_id
-        print(f"Cluster renamed: {old_cluster_id} → {new_cluster_id}")
-        print(f"Members: {', '.join(sorted(all_members))}")
-    
+        logger.info(f"Cluster renamed: {old_cluster_id} → {new_cluster_id}")
+        logger.info(f"Members: {', '.join(sorted(all_members))}")
+
     return new_cluster_id
 
 
@@ -396,34 +485,37 @@ async def check_for_other_nodes():
     """
     Check for other nodes in the cluster.
     If no nodes detected after DISCOVERY_TIMEOUT, become master.
-    
+
     TODO: This will be replaced with BLE mesh discovery
     For now, it's a placeholder that maintains master status.
     """
     # Simulate discovery period
     await asyncio.sleep(DISCOVERY_TIMEOUT)
-    
+
     # Clean up stale nodes
     current_time = time.time()
     stale_nodes = [
-        bin_id for bin_id, last_seen in node_state["discovered_nodes"].items()
+        bin_id
+        for bin_id, last_seen in node_state["discovered_nodes"].items()
         if current_time - last_seen > HEARTBEAT_TIMEOUT
     ]
-    
+
     for bin_id in stale_nodes:
-        print(f"Removing stale node: {bin_id}")
+        logger.info(f"Removing stale node: {bin_id}")
         del node_state["discovered_nodes"][bin_id]
         if bin_id in node_state["slaves"]:
             node_state["slaves"].remove(bin_id)
-    
+
     # Update cluster ID if members changed
     if stale_nodes:
         update_cluster_id()
-    
+
     # If no other nodes discovered, remain/become master
     if len(node_state["discovered_nodes"]) == 0:
         if not node_state["is_master"]:
-            print(f"No other nodes detected. {node_state['bin_id']} becoming master.")
+            logger.info(
+                f"No other nodes detected. {node_state['bin_id']} becoming master."
+            )
             node_state["is_master"] = True
             node_state["master_id"] = None
             node_state["last_election"] = datetime.utcnow()
@@ -445,6 +537,9 @@ async def startup_event():
     On startup, check for other nodes.
     If none found, become master.
     """
+    # If this wasnt a university project I would not use a deprecated method
+    # but FastAPI's lifespan handlers are more complex to implement and I dont give a rats ass
+    # about the deprecation warning for now
     logging.info(f"Starting {node_state['bin_id']}...")
     logging.info(f"Cluster: {node_state['cluster_id']}")
 
@@ -452,23 +547,19 @@ async def startup_event():
     asyncio.create_task(periodic_discovery())
     asyncio.create_task(lid_control_task())
     asyncio.create_task(occupancy_monitoring_task())
-    #TODO implement a task to raise an event when the bin is full or about to be full
-    
+    # TODO implement a task to raise an event when the bin is full or about to be full
 
     # Initial check
     await asyncio.sleep(2)  # Brief wait on startup
     if len(node_state["discovered_nodes"]) == 0:
-        print(f"No other nodes detected. {node_state['bin_id']} is MASTER.")
+        logger.info(f"No other nodes detected. {node_state['bin_id']} is MASTER.")
         node_state["is_master"] = True
         node_state["last_election"] = datetime.utcnow()
     else:
-        print(f"Detected {len(node_state['discovered_nodes'])} other nodes.")
-        print(f"Election may be needed...")
+        logger.info(f"Detected {len(node_state['discovered_nodes'])} other nodes.")
+        logger.info(f"Election may be needed...")
 
 
-# ============================================================================
-# PYDANTIC MODELS
-# ============================================================================
 
 class Telemetry(BaseModel):
     bin_id: str
@@ -515,10 +606,6 @@ class MasterStatus(BaseModel):
     last_election: Optional[datetime]
 
 
-# ============================================================================
-# CORE API ENDPOINTS (Backend Interface)
-# ============================================================================
-
 @app.post("/api/v1/telemetry")
 async def post_telemetry(data: List[Telemetry]):
     """
@@ -546,13 +633,12 @@ async def ack_command(ack: CommandAck):
     """
     bin_id = ack.bin_id
     cmd_id = ack.command_id
-    
+
     if bin_id in command_queue:
         command_queue[bin_id] = [
-            cmd for cmd in command_queue[bin_id] 
-            if cmd.get("command_id") != cmd_id
+            cmd for cmd in command_queue[bin_id] if cmd.get("command_id") != cmd_id
         ]
-    
+
     return {"status": "ok", "ack": ack.dict()}
 
 
@@ -562,32 +648,29 @@ async def post_election(data: ElectionResult):
     Log election result from cluster.
     Updates master/slave state based on election outcome.
     """
-    election_history.append({
-        **data.dict(),
-        "recorded_at": datetime.utcnow()
-    })
-    
+    election_history.append({**data.dict(), "recorded_at": datetime.utcnow()})
+
     # Update local node state based on election
     if data.chosen_master == node_state["bin_id"]:
         node_state["is_master"] = True
         node_state["master_id"] = None
         node_state["slaves"] = [
-            m.bin_id for m in data.members 
-            if m.bin_id != node_state["bin_id"]
+            m.bin_id for m in data.members if m.bin_id != node_state["bin_id"]
         ]
     else:
         node_state["is_master"] = False
         node_state["master_id"] = data.chosen_master
         node_state["slaves"] = []
-    
+
     node_state["last_election"] = datetime.utcnow()
-    
+
     return {"status": "logged", "new_master": data.chosen_master}
 
 
 # ============================================================================
 # MASTER/SLAVE STATUS WEBHOOK
 # ============================================================================
+
 
 @app.get("/api/v1/status", response_model=MasterStatus)
 async def get_status():
@@ -601,7 +684,7 @@ async def get_status():
         cluster_id=node_state["cluster_id"],
         master_id=node_state["master_id"],
         slaves=node_state["slaves"],
-        last_election=node_state["last_election"]
+        last_election=node_state["last_election"],
     )
 
 
@@ -610,17 +693,21 @@ async def rename_cluster(new_name: str):
     """
     Manually rename the cluster.
     Useful for giving meaningful names instead of auto-generated IDs.
-    
+
     Example: "Office-Floor-2" or "Warehouse-A"
     """
     old_name = node_state["cluster_id"]
     node_state["cluster_id"] = new_name
-    
+    global MANUAL_CLUSTER_RENAME
+    MANUAL_CLUSTER_RENAME = True
+
     return {
         "status": "renamed",
         "old_cluster_id": old_name,
         "new_cluster_id": new_name,
-        "members": sorted([node_state["bin_id"]] + list(node_state["discovered_nodes"].keys()))
+        "members": sorted(
+            [node_state["bin_id"]] + list(node_state["discovered_nodes"].keys())
+        ),
     }
 
 
@@ -628,34 +715,33 @@ async def rename_cluster(new_name: str):
 async def register_node(bin_id: str, cluster_id: Optional[str] = None):
     """
     Register a discovered node (for testing/manual registration).
-    
+
     In production, this will be replaced by BLE mesh HELLO messages.
     This endpoint simulates node discovery.
     """
     # Validate bin_id format
     if not bin_id.startswith("BIN-"):
-        raise HTTPException(
-            status_code=400,
-            detail="bin_id must start with 'BIN-'"
-        )
-    
+        raise HTTPException(status_code=400, detail="bin_id must start with 'BIN-'")
+
     # Update discovered nodes
     node_state["discovered_nodes"][bin_id] = time.time()
-    
+
     # Regenerate cluster ID based on new membership
     new_cluster_id = update_cluster_id()
-    
+
     # If we're master and this is a new node, add to slaves
     if node_state["is_master"] and bin_id not in node_state["slaves"]:
         node_state["slaves"].append(bin_id)
-    
+
     return {
         "status": "registered",
         "bin_id": bin_id,
         "cluster_id": node_state["cluster_id"],
         "is_master": node_state["is_master"],
         "total_nodes": len(node_state["discovered_nodes"]) + 1,  # +1 for self
-        "all_members": sorted([node_state["bin_id"]] + list(node_state["discovered_nodes"].keys()))
+        "all_members": sorted(
+            [node_state["bin_id"]] + list(node_state["discovered_nodes"].keys())
+        ),
     }
 
 
@@ -667,42 +753,43 @@ async def unregister_node(bin_id: str):
     """
     if bin_id in node_state["discovered_nodes"]:
         del node_state["discovered_nodes"][bin_id]
-    
+
     if bin_id in node_state["slaves"]:
         node_state["slaves"].remove(bin_id)
-    
+
     # Regenerate cluster ID based on remaining members
     update_cluster_id()
-    
-    # If no more nodes and we're not master, become master
+
     if len(node_state["discovered_nodes"]) == 0 and not node_state["is_master"]:
         node_state["is_master"] = True
         node_state["master_id"] = None
         node_state["last_election"] = datetime.utcnow()
-    
+
     return {
         "status": "unregistered",
         "bin_id": bin_id,
         "cluster_id": node_state["cluster_id"],
         "remaining_nodes": len(node_state["discovered_nodes"]),
-        "all_members": sorted([node_state["bin_id"]] + list(node_state["discovered_nodes"].keys()))
+        "all_members": sorted(
+            [node_state["bin_id"]] + list(node_state["discovered_nodes"].keys())
+        ),
     }
 
+    # ============================================================================
+    # HARDWARE ENDPOINTS (Not yet implemented - hardware pending)
+    # ============================================================================
 
-# ============================================================================
-# HARDWARE ENDPOINTS (Not yet implemented - hardware pending)
-# ============================================================================
-    
     return {
         "status": "unregistered",
         "bin_id": bin_id,
-        "remaining_nodes": len(node_state["discovered_nodes"])
+        "remaining_nodes": len(node_state["discovered_nodes"]),
     }
 
 
 # ============================================================================
 # HARDWARE ENDPOINTS (Not yet implemented - hardware pending)
 # ============================================================================
+
 
 @app.get("/api/v1/occupancy")
 async def get_occupancy():
@@ -716,11 +803,11 @@ async def get_occupancy():
 async def get_battery():
     """
     Get battery level as a percentage.
-    
+
     TODO: Hardware integration pending
     - Read from battery management IC (e.g., MAX17048)
     - Query voltage/percentage via I2C
-    
+
     Example implementation:
         battery_voltage = read_battery_voltage()
         battery_pct = voltage_to_percentage(battery_voltage)
@@ -734,12 +821,12 @@ async def get_battery():
 async def move_to_dock(dock_id: Optional[str] = "D1"):
     """
     Command bin to move to specified dock.
-    
+
     TODO: Hardware integration pending
     - Interface with motor controller
     - Implement navigation logic
     - Add obstacle detection
-    
+
     Example implementation:
         await motor_controller.navigate_to_dock(dock_id)
         await wait_for_docking_complete()
@@ -747,9 +834,8 @@ async def move_to_dock(dock_id: Optional[str] = "D1"):
     """
     # Mock response until hardware ready
     return {
-        "status": "mock",
         "message": f"Would move to dock {dock_id}",
-        "dock_id": dock_id
+        "dock_id": dock_id,
     }
 
 
@@ -757,38 +843,33 @@ async def move_to_dock(dock_id: Optional[str] = "D1"):
 async def motor_stop():
     """
     Emergency stop for motor movement.
-    
+
     TODO: Hardware integration pending
     - Immediate motor cutoff
     - Safety checks
-    
+
     Example implementation:
         motor_controller.emergency_stop()
         return {"status": "stopped"}
     """
-    return {"status": "mock", "message": "Would stop motor"}
+    return {"message": "Would stop motor"}
+
+
 @app.post("/api/v1/door/open")
 async def door_open():
     """
-    Command to open the door.
-    
-    TODO: Hardware integration pending
-    - Interface with door actuator
-    - Implement safety checks
-    
-    Example implementation:
-        await door_controller.open()
-        return {"status": "opened"}
+    Command to open the side door.
     """
     retval = {}
     if MOCK:
-        retval = { "message": "Would open door"}
+        retval = {"message": "Would open side door"}
     else:
 
-        retval = { "message": "Door opened"}
-    
+        retval = {"message": "Side door opened"}
+
     task = asyncio.create_task(open_door())
     return retval
+
 
 @app.post("/api/v1/door/close")
 async def door_close():
@@ -803,7 +884,9 @@ async def door_close():
         await door_controller.close()
         return {"status": "closed"}
     """
-    return {"status": "mock", "message": "Would close door"}
+    # I probably should ask if I just run the open_door function in reverse...
+    return {"message": "Would close door"}
+
 
 @app.get("/api/v1/environment/temperature")
 async def get_temperature():
@@ -817,6 +900,7 @@ async def get_temperature():
         retval = {"temperature_celsius": dhtDevice.temp_c}
     return retval
 
+
 @app.get("/api/v1/environment/humidity")
 async def get_humidity():
     """
@@ -829,6 +913,7 @@ async def get_humidity():
         retval = {"humidity_relative": dhtDevice.humidity}
     return retval
 
+
 @app.get("/api/v1/environment")
 async def get_environment():
     """
@@ -838,41 +923,43 @@ async def get_environment():
     if MOCK:
         retval = {"temperature_celsius": 22.5, "humidity_relative": 55.0}
     else:
-        retval = {"temperature_celsius": dhtDevice.temp_c, "humidity_relative": dhtDevice.humidity}
+        retval = {
+            "temperature_celsius": dhtDevice.temp_c,
+            "humidity_relative": dhtDevice.humidity,
+        }
     return retval
+
 
 @app.get("/api/v1/signal-strength")
 async def get_signal_strength():
     """
     Get BLE/WiFi signal strength (RSSI).
-    
+
     TODO: Hardware integration pending
     - Query BLE adapter for RSSI to master
     - Or WiFi RSSI if connected to AP
-    
+
     Example implementation:
         rssi = get_ble_rssi_to_master()
         return {"rssi": rssi}
     """
     retval = {}
     if MOCK:
-        retval = {"rssi": -65, "status": "mock"}
+        retval = {"rssi": -65}
     else:
-        retval = {"rssi": get_ble_rssi_to_master(), "status": "deployed"}
+        # this shit isnt implemented yet
+        # If Alexander Graham Bell saw what we were doing with mobile phones now... he'd probably kill himself
+        retval = {"rssi": "CAN YOU HEAR ME NOW????"}
     return retval
 
-
-# ============================================================================
-# ROOT & HEALTH
-# ============================================================================
 
 @app.get("/")
 async def root():
     return {
         "service": "Smart Bin API",
-        "version": "1.0.0",
+        "version": __VERSION__,
         "node": node_state["bin_id"],
-        "is_master": node_state["is_master"]
+        "is_master": node_state["is_master"],
     }
 
 
@@ -881,10 +968,7 @@ async def health_check():
     return {"status": "healthy"}
 
 
-# ============================================================================
-# MAIN
-# ============================================================================
-
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
