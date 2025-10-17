@@ -49,7 +49,7 @@ try:
     import spidev
     from adafruit_servokit import ServoKit
     from dbus_next.aio import MessageBus
-    from gpiozero import DigitalInputDevice
+    #from gpiozero import DigitalInputDevice
 
     logger.info("Hardware libraries imported successfully")
 except ImportError as e:
@@ -726,7 +726,7 @@ async def startup_event():
     # Initialize GPIO if on real hardware
     if MOCK == 0:
         logger.info("Initializing GPIO pins...")
-        controller = GPIO.gpiochip_open(4)
+        controller = GPIO.gpiochip_open(0)
         
         # Free GPIO pins if they're already claimed (cleanup from previous run)
         try:
