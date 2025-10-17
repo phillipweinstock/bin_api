@@ -214,9 +214,35 @@ if MOCK == 0:
     spi = spidev.SpiDev()
     spi.open(0, 0)  # Open SPI bus 0, device 0
     kit = ServoKit(channels=16)
+  
     controller = GPIO.gpiochip_open(4)
-    GPIO.gpio_claim_output(controller, TRIG)
-    GPIO.gpio_claim_input(controller, ECHO)
+    try:
+        GPIO.gpio_free(controller, TRIG)
+        logger.debug(f"Freed GPIO pin {TRIG}")
+    except Exception as e:
+        logger.debug(f"GPIO pin {TRIG} was not claimed: {e}")
+    
+    try:
+        GPIO.gpio_free(controller, ECHO)
+        logger.debug(f"Freed GPIO pin {ECHO}")
+    except Exception as e:
+        logger.debug(f"GPIO pin {ECHO} was not claimed: {e}")
+    
+    # Now claim the pins
+    try:
+        GPIO.gpio_claim_output(controller, TRIG)
+        logger.info(f"Claimed GPIO pin {TRIG} as output (TRIG)")
+    except Exception as e:
+        logger.error(f"Failed to claim GPIO pin {TRIG}: {e}")
+        raise
+    
+    try:
+        GPIO.gpio_claim_input(controller, ECHO)
+        logger.info(f"Claimed GPIO pin {ECHO} as input (ECHO)")
+    except Exception as e:
+        logger.error(f"Failed to claim GPIO pin {ECHO}: {e}")
+        raise
+    
     class WifiController:
         def __init__(self,interface='wlan0'):
             self.interface=interface
@@ -658,6 +684,27 @@ async def startup_event():
     else:
         logger.info(f"Detected {len(node_state['discovered_nodes'])} other nodes.")
         logger.info(f"Election may be needed...")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """
+    Clean up resources on shutdown.
+    """
+    logger.info("Shutting down...")
+    
+    # Clean up GPIO if running on real hardware
+    if MOCK == 0:
+        try:
+            logger.info("Cleaning up GPIO pins...")
+            GPIO.gpio_free(controller, TRIG)
+            GPIO.gpio_free(controller, ECHO)
+            GPIO.gpiochip_close(controller)
+            logger.info("GPIO cleanup complete")
+        except Exception as e:
+            logger.error(f"Error during GPIO cleanup: {e}")
+    
+    logger.info("Shutdown complete")
 
 
 
