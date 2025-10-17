@@ -207,41 +207,18 @@ except ImportError as e:
     MOCK = 1
 
 # Initialize hardware components (real or mock)
+# NOTE: GPIO initialization is deferred to startup event to avoid import-time conflicts
+controller = None  # Will be initialized in startup_event
+
 if MOCK == 0:
-    logger.info("Initializing real hardware components")
+    logger.info("Initializing real hardware components (GPIO deferred to startup)")
     dhtDevice = adafruit_dht.DHT11(board.D17)
     motor_controller = motoron.MotoronI2C(address=0x58)
     spi = spidev.SpiDev()
     spi.open(0, 0)  # Open SPI bus 0, device 0
     kit = ServoKit(channels=16)
-  
-    controller = GPIO.gpiochip_open(4)
-    try:
-        GPIO.gpio_free(controller, TRIG)
-        logger.debug(f"Freed GPIO pin {TRIG}")
-    except Exception as e:
-        logger.debug(f"GPIO pin {TRIG} was not claimed: {e}")
     
-    try:
-        GPIO.gpio_free(controller, ECHO)
-        logger.debug(f"Freed GPIO pin {ECHO}")
-    except Exception as e:
-        logger.debug(f"GPIO pin {ECHO} was not claimed: {e}")
-    
-    # Now claim the pins
-    try:
-        GPIO.gpio_claim_output(controller, TRIG)
-        logger.info(f"Claimed GPIO pin {TRIG} as output (TRIG)")
-    except Exception as e:
-        logger.error(f"Failed to claim GPIO pin {TRIG}: {e}")
-        raise
-    
-    try:
-        GPIO.gpio_claim_input(controller, ECHO)
-        logger.info(f"Claimed GPIO pin {ECHO} as input (ECHO)")
-    except Exception as e:
-        logger.error(f"Failed to claim GPIO pin {ECHO}: {e}")
-        raise
+    # GPIO will be initialized in startup_event to avoid import-time claiming
     
     class WifiController:
         def __init__(self,interface='wlan0'):
@@ -662,9 +639,45 @@ async def startup_event():
     On startup, check for other nodes.
     If none found, become master.
     """
+    global controller
+    
     # If this wasnt a university project I would not use a deprecated method
     # but FastAPI's lifespan handlers are more complex to implement and I dont give a rats ass
     # about the deprecation warning for now
+    
+    # Initialize GPIO if on real hardware
+    if MOCK == 0:
+        logger.info("Initializing GPIO pins...")
+        controller = GPIO.gpiochip_open(4)
+        
+        # Free GPIO pins if they're already claimed (cleanup from previous run)
+        try:
+            GPIO.gpio_free(controller, TRIG)
+            logger.debug(f"Freed GPIO pin {TRIG}")
+        except Exception as e:
+            logger.debug(f"GPIO pin {TRIG} was not claimed: {e}")
+        
+        try:
+            GPIO.gpio_free(controller, ECHO)
+            logger.debug(f"Freed GPIO pin {ECHO}")
+        except Exception as e:
+            logger.debug(f"GPIO pin {ECHO} was not claimed: {e}")
+        
+        # Now claim the pins
+        try:
+            GPIO.gpio_claim_output(controller, TRIG)
+            logger.info(f"Claimed GPIO pin {TRIG} as output (TRIG)")
+        except Exception as e:
+            logger.error(f"Failed to claim GPIO pin {TRIG}: {e}")
+            raise
+        
+        try:
+            GPIO.gpio_claim_input(controller, ECHO)
+            logger.info(f"Claimed GPIO pin {ECHO} as input (ECHO)")
+        except Exception as e:
+            logger.error(f"Failed to claim GPIO pin {ECHO}: {e}")
+            raise
+    
     logging.info(f"Starting {node_state['bin_id']}...")
     logging.info(f"Cluster: {node_state['cluster_id']}")
 
@@ -686,6 +699,7 @@ async def startup_event():
         logger.info(f"Election may be needed...")
 
 
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """
@@ -694,7 +708,7 @@ async def shutdown_event():
     logger.info("Shutting down...")
     
     # Clean up GPIO if running on real hardware
-    if MOCK == 0:
+    if MOCK == 0 and controller is not None:
         try:
             logger.info("Cleaning up GPIO pins...")
             GPIO.gpio_free(controller, TRIG)
@@ -1192,7 +1206,7 @@ if __name__ == "__main__":
     import uvicorn
     # Disable reload on real hardware to avoid GPIO conflicts
     # The reload feature spawns child processes that try to claim already-claimed GPIO pins
-    use_reload = MOCK == 1  # Only use reload in mock/development mode
-    if not use_reload:
-        logger.info("Running on real hardware - auto-reload disabled")
+    #use_reload = MOCK == 1  # Only use reload in mock/development mode
+    #if not use_reload:
+        #logger.info("Running on real hardware - auto-reload disabled")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=use_reload)
