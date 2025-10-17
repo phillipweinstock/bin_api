@@ -49,7 +49,7 @@ try:
     import spidev
     from adafruit_servokit import ServoKit
     from dbus_next.aio import MessageBus
-    #from gpiozero import DigitalInputDevice
+    from gpiozero import DigitalInputDevice
 
     logger.info("Hardware libraries imported successfully")
 except ImportError as e:
