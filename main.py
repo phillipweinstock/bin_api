@@ -1190,4 +1190,9 @@ async def preview_telemetry():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Disable reload on real hardware to avoid GPIO conflicts
+    # The reload feature spawns child processes that try to claim already-claimed GPIO pins
+    use_reload = MOCK == 1  # Only use reload in mock/development mode
+    if not use_reload:
+        logger.info("Running on real hardware - auto-reload disabled")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=use_reload)
