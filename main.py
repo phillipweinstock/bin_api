@@ -214,7 +214,7 @@ if MOCK == 0:
     spi = spidev.SpiDev()
     spi.open(0, 0)  # Open SPI bus 0, device 0
     kit = ServoKit(channels=16)
-    controller = GPIO.gpiochip_open()
+    controller = GPIO.gpiochip_open(4)
     GPIO.gpio_claim_output(controller, TRIG)
     GPIO.gpio_claim_input(controller, ECHO)
     class WifiController:
