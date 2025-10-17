@@ -1022,6 +1022,26 @@ async def get_occupancy():
     return {"occupancy_percentage": CURRENT_OCCUPANCY}
 
 
+@app.get("/api/v1/lid/status")
+async def get_lid_status():
+    """
+    Get current lid sensor status and lock state.
+    Useful for debugging lid control task.
+    """
+    try:
+        sensor = DigitalInputDevice(26)
+        sensor_value = sensor.value
+    except Exception as e:
+        sensor_value = f"error: {e}"
+    
+    return {
+        "lid_locked": LID_LOCKED,
+        "sensor_value": sensor_value,
+        "sensor_triggered": sensor_value == 0 if isinstance(sensor_value, int) else False,
+        "note": "sensor_value=0 means triggered (active low)"
+    }
+
+
 @app.get("/api/v1/battery")
 async def get_battery():
     """
