@@ -342,6 +342,7 @@ async def lid_control_task():
         servo.actuation_range = 180
         sensor = DigitalInputDevice(26)
         logging.info("Lid control task started")
+        last_sensor_state = None
         while True:
             try:
                 if LID_LOCKED:
@@ -349,6 +350,13 @@ async def lid_control_task():
                     logging.info("Lid is locked. Keeping closed.")
                     await asyncio.sleep(0.5)
                     continue
+                
+                # Log sensor state changes for debugging
+                current_sensor_state = sensor.value
+                if current_sensor_state != last_sensor_state:
+                    logger.debug(f"Sensor state changed: {last_sensor_state} -> {current_sensor_state}")
+                    last_sensor_state = current_sensor_state
+                
                 if sensor.value == 0:
                     logging.info("Sensor triggered! Opening lid...")
                     servo.angle = 180
@@ -1180,7 +1188,11 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "background_tasks": len(background_tasks),
+        "tasks_running": [str(task.get_name()) for task in background_tasks]
+    }
 
 
 @app.get("/api/v1/telemetry/preview")
