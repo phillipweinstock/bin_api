@@ -509,10 +509,6 @@ def generate_cluster_id(bin_ids: List[str]):
     return f"CLUSTER-{cluster_hash}"
 
 
-# ============================================================================
-# STATE MANAGEMENT
-# ============================================================================
-
 # Generate unique bin ID for this unit
 BIN_ID = generate_bin_id()
 
@@ -534,11 +530,6 @@ HEARTBEAT_TIMEOUT = 60  # seconds - if no heartbeat, node is considered offline
 command_queue: Dict[str, List[dict]] = {}
 telemetry_buffer: List[dict] = []
 election_history: List[dict] = []
-
-
-# ============================================================================
-# DISCOVERY & ELECTION LOGIC
-# ============================================================================
 
 
 def update_cluster_id():
@@ -833,7 +824,6 @@ class ClusterSummary(BaseModel):
 
 
 class TelemetryPayload(BaseModel):
-    """Comprehensive telemetry payload including master and all slaves"""
     master_node: Telemetry
     slave_nodes: List[Telemetry]
     cluster_summary: ClusterSummary
@@ -890,6 +880,18 @@ async def get_commands(bin_id: str):
     
     Returns:
         - List of pending Command objects for the specified bin_id
+    
+    Example Response:
+        ```json
+        [
+            {
+                "command_id": "cmd-12345",
+                "bin_id": "BIN-CB9B8676",
+                "action": "open_lid",
+                "params": {}
+            }
+        ]
+        ```
     """
     return command_queue.get(bin_id, [])
 
@@ -903,6 +905,19 @@ async def ack_command(ack: CommandAck):
     Returns:
         - status: Status message (ok)
         - ack: The acknowledged CommandAck object
+    
+    Example Response:
+        ```json
+        {
+            "status": "ok",
+            "ack": {
+                "bin_id": "BIN-CB9B8676",
+                "command_id": "cmd-12345",
+                "success": true,
+                "message": "Lid opened successfully"
+            }
+        }
+        ```
     """
     bin_id = ack.bin_id
     cmd_id = ack.command_id
@@ -924,6 +939,14 @@ async def post_election(data: ElectionResult):
     Returns:
         - status: Status message (logged)
         - new_master: Bin ID of the newly elected master
+    
+    Example Response:
+        ```json
+        {
+            "status": "logged",
+            "new_master": "BIN-CB9B8676"
+        }
+        ```
     """
     election_history.append({**data.dict(), "recorded_at": datetime.utcnow()})
 
@@ -943,12 +966,6 @@ async def post_election(data: ElectionResult):
 
     return {"status": "logged", "new_master": data.chosen_master}
 
-
-# ============================================================================
-# MASTER/SLAVE STATUS WEBHOOK
-# ============================================================================
-
-
 @app.get("/api/v1/status", response_model=MasterStatus)
 async def get_status():
     """
@@ -962,6 +979,18 @@ async def get_status():
         - master_id: Bin ID of the cluster master
         - slaves: List of slave bin IDs in the cluster
         - last_election: Timestamp of last election event
+    
+    Example Response:
+        ```json
+        {
+            "bin_id": "BIN-CB9B8676",
+            "is_master": true,
+            "cluster_id": "SOLO-CB9B",
+            "master_id": null,
+            "slaves": [],
+            "last_election": "2025-10-18T14:23:45.123456"
+        }
+        ```
     """
     return MasterStatus(
         bin_id=node_state["bin_id"],
@@ -986,6 +1015,16 @@ async def rename_cluster(new_name: str):
         - old_cluster_id: Previous cluster identifier
         - new_cluster_id: New cluster identifier
         - members: List of all bin IDs in the cluster
+    
+    Example Response:
+        ```json
+        {
+            "status": "renamed",
+            "old_cluster_id": "SOLO-CB9B",
+            "new_cluster_id": "Office-Floor-2",
+            "members": ["BIN-CB9B8676"]
+        }
+        ```
     """
     old_name = node_state["cluster_id"]
     node_state["cluster_id"] = new_name
@@ -1018,6 +1057,18 @@ async def register_node(bin_id: str, cluster_id: Optional[str] = None):
         
     Errors:
         - 400: Invalid bin_id format (must start with 'BIN-')
+    
+    Example Response:
+        ```json
+        {
+            "status": "registered",
+            "bin_id": "BIN-AAAABBBB",
+            "cluster_id": "CLUSTER-3AC5",
+            "is_master": true,
+            "total_nodes": 2,
+            "all_members": ["BIN-AAAABBBB", "BIN-CB9B8676"]
+        }
+        ```
     """
     if not bin_id.startswith("BIN-"):
         raise HTTPException(status_code=400, detail="bin_id must start with 'BIN-'")
@@ -1045,6 +1096,24 @@ async def unregister_node(bin_id: str):
     """
     Remove a node from discovered nodes (for testing).
     Simulates node going offline.
+    
+    Returns:
+        - status: Status message (unregistered)
+        - bin_id: The unregistered bin ID
+        - cluster_id: Updated cluster identifier
+        - remaining_nodes: Number of discovered nodes remaining
+        - all_members: List of all remaining bin IDs in cluster
+    
+    Example Response:
+        ```json
+        {
+            "status": "unregistered",
+            "bin_id": "BIN-AAAABBBB",
+            "cluster_id": "SOLO-CB9B",
+            "remaining_nodes": 0,
+            "all_members": ["BIN-CB9B8676"]
+        }
+        ```
     """
     if bin_id in node_state["discovered_nodes"]:
         del node_state["discovered_nodes"][bin_id]
@@ -1070,20 +1139,11 @@ async def unregister_node(bin_id: str):
         ),
     }
 
-    # ============================================================================
-    # HARDWARE ENDPOINTS (Not yet implemented - hardware pending)
-    # ============================================================================
-
     return {
         "status": "unregistered",
         "bin_id": bin_id,
         "remaining_nodes": len(node_state["discovered_nodes"]),
     }
-
-
-# ============================================================================
-# HARDWARE ENDPOINTS (Not yet implemented - hardware pending)
-# ============================================================================
 
 
 @app.get("/api/v1/occupancy")
@@ -1093,6 +1153,13 @@ async def get_occupancy():
     
     Returns:
         - occupancy_percentage: Float between 0-100 representing fill level
+    
+    Example Response:
+        ```json
+        {
+            "occupancy_percentage": 15.82
+        }
+        ```
     """
     return {"occupancy_percentage": CURRENT_OCCUPANCY}
 
@@ -1109,6 +1176,18 @@ async def get_lid_status():
         - sensor_triggered: Boolean indicating if sensor is currently triggered
         - note: Explanation of sensor behavior
         - gpio_library: Name of GPIO library in use
+    
+    Example Response:
+        ```json
+        {
+            "lid_locked": false,
+            "sensor_pin": 26,
+            "sensor_value": 1,
+            "sensor_triggered": false,
+            "note": "sensor_value=0 means triggered (active low)",
+            "gpio_library": "lgpio"
+        }
+        ```
     """
     try:
         if MOCK == 0:
@@ -1136,6 +1215,14 @@ async def get_battery():
     Returns:
         - battery_percentage: Float between 0-100
         - status: Status string (mock/ok)
+    
+    Example Response:
+        ```json
+        {
+            "battery_percentage": 87.3,
+            "status": "mock-this would be replaced with a battery status reading"
+        }
+        ```
     """
     return {"battery_percentage": 87.3, "status": "mock-this would be replaced with a battery status reading"}
 
@@ -1165,6 +1252,13 @@ async def motor_stop():
     
     Returns:
         - message: Confirmation message
+    
+    Example Response:
+        ```json
+        {
+            "message": "Would stop motor"
+        }
+        ```
     """
     return {"message": "Would stop motor"}
 
@@ -1176,6 +1270,13 @@ async def door_open():
     
     Returns:
         - message: Status message indicating door action
+    
+    Example Response:
+        ```json
+        {
+            "message": "Side door opened"
+        }
+        ```
     """
     retval = {}
     if MOCK:
@@ -1195,6 +1296,13 @@ async def door_close():
     
     Returns:
         - message: Status message indicating door action
+    
+    Example Response:
+        ```json
+        {
+            "message": "Would close door"
+        }
+        ```
     """
     return {"message": "Would close door"}
 
@@ -1211,6 +1319,13 @@ async def get_temperature():
         - 503: Invalid temperature reading from sensor
         - 504: Sensor read timeout (disconnected or malfunctioning)
         - 500: Unexpected sensor error
+    
+    Example Response:
+        ```json
+        {
+            "temperature_celsius": 22.5
+        }
+        ```
     """
     if MOCK:
         return {"temperature_celsius": 22.5}
@@ -1251,6 +1366,13 @@ async def get_humidity():
         - 503: Invalid humidity reading from sensor
         - 504: Sensor read timeout (disconnected or malfunctioning)
         - 500: Unexpected sensor error
+    
+    Example Response:
+        ```json
+        {
+            "humidity_relative": 55.0
+        }
+        ```
     """
     if MOCK:
         return {"humidity_relative": 55.0}
@@ -1293,6 +1415,15 @@ async def get_environment():
         - 503: Sensor read failed or returned invalid data
         - 504: Sensor read timeout (disconnected or malfunctioning)
         - 500: Unexpected sensor error
+    
+    Example Response:
+        ```json
+        {
+            "temperature_celsius": 22.5,
+            "humidity_relative": 55.0,
+            "status": "ok"
+        }
+        ```
     """
     if MOCK:
         return {
@@ -1358,6 +1489,13 @@ async def get_signal_strength():
     
     Returns:
         - rssi: Integer RSSI value in dBm (typically -30 to -90)
+    
+    Example Response:
+        ```json
+        {
+            "rssi": -65
+        }
+        ```
     """
     retval = {}
     if MOCK:
@@ -1379,6 +1517,16 @@ async def root():
         - version: API version string
         - node: Bin ID of this node
         - is_master: Boolean indicating if this node is cluster master
+    
+    Example Response:
+        ```json
+        {
+            "service": "Smart Bin API",
+            "version": "1.0.0",
+            "node": "BIN-CB9B8676",
+            "is_master": true
+        }
+        ```
     """
     return {
         "service": "Smart Bin API",
@@ -1397,6 +1545,15 @@ async def health_check():
         - status: String indicating service health (healthy/unhealthy)
         - background_tasks: Number of active background tasks
         - tasks_running: List of running background task names
+    
+    Example Response:
+        ```json
+        {
+            "status": "healthy",
+            "background_tasks": 3,
+            "tasks_running": ["periodic_discovery", "lid_control_task", "occupancy_monitoring_task"]
+        }
+        ```
     """
     return {
         "status": "healthy",
@@ -1422,6 +1579,22 @@ async def preview_telemetry():
         - is_master: Boolean indicating if this node is master
         - master_id: Cluster master bin ID
         - cluster_id: Cluster identifier
+    
+    Example Response:
+        ```json
+        {
+            "bin_id": "BIN-CB9B8676",
+            "timestamp": "2025-10-18T14:23:45.123456",
+            "fill_level": 15.82,
+            "battery": 100.0,
+            "signal_strength": -50,
+            "temperature": 25.0,
+            "humidity": 50.0,
+            "is_master": true,
+            "master_id": null,
+            "cluster_id": "SOLO-CB9B"
+        }
+        ```
     """
     current_temp = dhtDevice.temperature if MOCK == 0 else 25.0
     current_humidity = dhtDevice.humidity if MOCK == 0 else 50.0
