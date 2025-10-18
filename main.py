@@ -9,6 +9,7 @@ import time
 import uuid
 import subprocess
 import platform
+import threading
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -49,19 +50,6 @@ try:
     import spidev
     from adafruit_servokit import ServoKit
     from dbus_next.aio import MessageBus
-    
-    # Import gpiozero and configure it to use RPi.GPIO to avoid lgpio conflicts
-    import gpiozero
-    try:
-        # Try to use RPi.GPIO backend to avoid conflicts with our lgpio usage
-        from gpiozero.pins.rpigpio import RPiGPIOFactory
-        gpiozero.Device.pin_factory = RPiGPIOFactory()
-        logger.info("gpiozero configured to use RPi.GPIO backend")
-    except ImportError:
-        # RPi.GPIO not available, use native backend but warn about potential conflicts
-        logger.warning("RPi.GPIO not available, gpiozero will use default backend (may conflict with lgpio)")
-    
-    from gpiozero import DigitalInputDevice
 
     logger.info("Hardware libraries imported successfully")
 except ImportError as e:
@@ -190,6 +178,9 @@ except ImportError as e:
             @property
             def humidity(self):
                 return 50.0
+            @property
+            def temperature(self):
+                return 25.0
 
     class spidev:
         class SpiDev:
@@ -268,6 +259,8 @@ app = FastAPI(
 )
 
 background_tasks = set()
+
+dht_lock = threading.Lock()
 
 
 async def get_distance():
@@ -350,16 +343,25 @@ async def occupancy_monitoring_task():
 async def lid_control_task():
     """
     Control lid using servo on channel 10.
-    Uses gpiozero for sensor reading (same as original working code).
+    Uses lgpio for sensor reading (RPi5 compatible).
     """
     background_tasks.add(asyncio.current_task())
     
     try:
         servo = kit.servo[10]
         servo.actuation_range = 180
-        
-        # Use gpiozero DigitalInputDevice like the original working code
-        sensor = DigitalInputDevice(LID_SENSOR)
+        lid_sensor_gpio = None
+        if MOCK == 0:
+            try:
+                # Set up GPIO 26 as input with pull-up resistor (sensor is active low)
+                GPIO.gpio_claim_input(controller, LID_SENSOR, GPIO.SET_PULL_UP)
+                lid_sensor_gpio = LID_SENSOR
+                logger.info(f"Lid sensor initialized on GPIO {LID_SENSOR} using lgpio")
+            except Exception as e:
+                logger.error(f"Failed to initialize lid sensor on GPIO {LID_SENSOR}: {e}")
+                logger.warning("Lid sensor disabled - continuing without it")
+        else:
+            logger.info("Mock mode - lid sensor disabled")
         
         logging.info("Lid control task started")
         last_sensor_state = None
@@ -367,28 +369,37 @@ async def lid_control_task():
         while True:
             try:
                 if LID_LOCKED:
-                    servo.angle = 0
+                    with dht_lock:
+                        servo.angle = 0
                     logging.info("Lid is locked. Keeping closed.")
                     await asyncio.sleep(0.5)
                     continue
                 
-                # Read sensor using gpiozero (active low - 0 = triggered)
-                sensor_value = sensor.value
-                
-                # Log sensor state changes for debugging
-                if sensor_value != last_sensor_state:
-                    logger.debug(f"Lid sensor state changed: {last_sensor_state} -> {sensor_value}")
-                    last_sensor_state = sensor_value
-                
-                if sensor_value == 0:  # Sensor triggered (active low)
-                    logging.info("Lid sensor triggered! Opening lid...")
-                    servo.angle = 180
-                    await asyncio.sleep(5)
-                    logging.info("Closing lid...")
-                    servo.angle = 0
-                    await asyncio.sleep(1)  # Debounce
+                if lid_sensor_gpio is not None:
+                    # Read sensor using lgpio (active low - 0 = triggered)
+                    sensor_value = GPIO.gpio_read(controller, lid_sensor_gpio)
+                    
+                    # Log sensor state changes for debugging
+                    if sensor_value != last_sensor_state:
+                        logger.debug(f"Lid sensor state changed: {last_sensor_state} -> {sensor_value}")
+                        last_sensor_state = sensor_value
+                    
+                    if sensor_value == 0:  # Sensor triggered (active low)
+                        logging.info("Lid sensor triggered! Opening lid...")
+                        with dht_lock:
+                            servo.angle = 180
+                        await asyncio.sleep(5)
+                        logging.info("Closing lid...")
+                        with dht_lock:
+                            servo.angle = 0
+                        await asyncio.sleep(1)  # Debounce
+                    else:
+                        with dht_lock:
+                            servo.angle = 0
                 else:
-                    servo.angle = 0
+                    with dht_lock:
+                        servo.angle = 0
+                
                 await asyncio.sleep(0.1)
                 
             except asyncio.CancelledError:
@@ -407,12 +418,13 @@ async def open_door():
     background_tasks.add(asyncio.current_task())
     servo = kit.servo[11]
     servo.actuation_range = 180
-    for angle in range(0, 181, 10):
-        servo.angle = angle
-        await asyncio.sleep(0.05)
-    for angle in range(180, -1, -10):
-        servo.angle = angle
-        await asyncio.sleep(0.05)
+    with dht_lock:
+        for angle in range(0, 181, 10):
+            servo.angle = angle
+            await asyncio.sleep(0.05)
+        for angle in range(180, -1, -10):
+            servo.angle = angle
+            await asyncio.sleep(0.05)
     background_tasks.remove(asyncio.current_task())
 
 
@@ -653,26 +665,32 @@ async def periodic_telemetry():
                     }
                     telemetry_payload["slave_nodes"].append(slave_telemetry)
             
-            # Send to webhook endpoint
-            logger.info(f"Sending telemetry for cluster {node_state['cluster_id']}: " +
-                       f"{len(telemetry_payload['slave_nodes']) + 1} nodes")
+            # Send to webhook endpoint with shorter timeout and better error handling
+            logger.info(f"Attempting to send telemetry to {WEBHOOK}")
             
-            # Run the blocking request in a thread pool to avoid blocking event loop
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None, 
-                lambda: requests.post(WEBHOOK, json=telemetry_payload, timeout=10)
-            )
-            
-            if response.status_code == 200:
-                logger.info(f"Telemetry sent successfully to {WEBHOOK}")
-            else:
-                logger.warning(f"Telemetry failed with status {response.status_code}: {response.text}")
+            try:
+                # Run the blocking request in a thread pool with short timeout
+                loop = asyncio.get_event_loop()
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, 
+                        lambda: requests.post(WEBHOOK, json=telemetry_payload, timeout=3)
+                    ),
+                    timeout=5.0  # Total timeout including thread pool overhead
+                )
                 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to send telemetry to {WEBHOOK}: {e}")
+                if response.status_code == 200:
+                    logger.info(f"Telemetry sent successfully to {WEBHOOK}")
+                else:
+                    logger.warning(f"Telemetry failed with status {response.status_code}: {response.text}")
+            except asyncio.TimeoutError:
+                logger.error(f"Telemetry request to {WEBHOOK} timed out after 5 seconds")
+            except requests.exceptions.ConnectionError:
+                logger.error(f"Cannot connect to webhook {WEBHOOK} - is the server running?")
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to send telemetry to {WEBHOOK}: {e}")
+                
         except asyncio.CancelledError:
-            # Task is being cancelled (shutdown), re-raise to stop gracefully
             logger.info("Telemetry task cancelled, shutting down")
             raise
         except Exception as e:
@@ -752,7 +770,7 @@ async def startup_event():
 
     # Start periodic tasks in background
     asyncio.create_task(periodic_discovery())
-    asyncio.create_task(periodic_telemetry())
+    #asyncio.create_task(periodic_telemetry())
     asyncio.create_task(lid_control_task())
     asyncio.create_task(occupancy_monitoring_task())
     # TODO implement a task to raise an event when the bin is full or about to be full
@@ -782,7 +800,7 @@ async def shutdown_event():
             logger.info("Cleaning up GPIO pins...")
             GPIO.gpio_free(controller, TRIG)
             GPIO.gpio_free(controller, ECHO)
-            # Note: LID_SENSOR uses gpiozero and cleans up automatically
+            GPIO.gpio_free(controller, LID_SENSOR)
             GPIO.gpiochip_close(controller)
             logger.info("GPIO cleanup complete")
         except Exception as e:
@@ -869,6 +887,9 @@ async def get_commands(bin_id: str):
     """
     Retrieve pending commands for a specific bin.
     Master node fetches commands for itself and slaves.
+    
+    Returns:
+        - List of pending Command objects for the specified bin_id
     """
     return command_queue.get(bin_id, [])
 
@@ -878,6 +899,10 @@ async def ack_command(ack: CommandAck):
     """
     Acknowledge command completion.
     Removes command from queue after execution.
+    
+    Returns:
+        - status: Status message (ok)
+        - ack: The acknowledged CommandAck object
     """
     bin_id = ack.bin_id
     cmd_id = ack.command_id
@@ -895,6 +920,10 @@ async def post_election(data: ElectionResult):
     """
     Log election result from cluster.
     Updates master/slave state based on election outcome.
+    
+    Returns:
+        - status: Status message (logged)
+        - new_master: Bin ID of the newly elected master
     """
     election_history.append({**data.dict(), "recorded_at": datetime.utcnow()})
 
@@ -925,6 +954,14 @@ async def get_status():
     """
     Advertise this unit's master/slave status and list slaves.
     Used for monitoring and debugging mesh topology.
+    
+    Returns:
+        - bin_id: This node's bin ID
+        - is_master: Boolean indicating if this node is cluster master
+        - cluster_id: Current cluster identifier
+        - master_id: Bin ID of the cluster master
+        - slaves: List of slave bin IDs in the cluster
+        - last_election: Timestamp of last election event
     """
     return MasterStatus(
         bin_id=node_state["bin_id"],
@@ -943,6 +980,12 @@ async def rename_cluster(new_name: str):
     Useful for giving meaningful names instead of auto-generated IDs.
 
     Example: "Office-Floor-2" or "Warehouse-A"
+    
+    Returns:
+        - status: Status message (renamed)
+        - old_cluster_id: Previous cluster identifier
+        - new_cluster_id: New cluster identifier
+        - members: List of all bin IDs in the cluster
     """
     old_name = node_state["cluster_id"]
     node_state["cluster_id"] = new_name
@@ -966,18 +1009,22 @@ async def register_node(bin_id: str, cluster_id: Optional[str] = None):
 
     In production, this will be replaced by BLE mesh HELLO messages.
     This endpoint simulates node discovery.
+    
+    Returns:
+        - status: Status message (registered)
+        - bin_id: The registered bin ID
+        - cluster_id: Updated cluster identifier
+        - total_nodes: Total number of nodes in cluster
+        
+    Errors:
+        - 400: Invalid bin_id format (must start with 'BIN-')
     """
-    # Validate bin_id format
     if not bin_id.startswith("BIN-"):
         raise HTTPException(status_code=400, detail="bin_id must start with 'BIN-'")
 
-    # Update discovered nodes
     node_state["discovered_nodes"][bin_id] = time.time()
-
-    # Regenerate cluster ID based on new membership
     new_cluster_id = update_cluster_id()
 
-    # If we're master and this is a new node, add to slaves
     if node_state["is_master"] and bin_id not in node_state["slaves"]:
         node_state["slaves"].append(bin_id)
 
@@ -1043,6 +1090,9 @@ async def unregister_node(bin_id: str):
 async def get_occupancy():
     """
     Get garbage bin fill level as a percentage.
+    
+    Returns:
+        - occupancy_percentage: Float between 0-100 representing fill level
     """
     return {"occupancy_percentage": CURRENT_OCCUPANCY}
 
@@ -1051,12 +1101,20 @@ async def get_occupancy():
 async def get_lid_status():
     """
     Get current lid sensor status and lock state.
-    Useful for debugging lid control task.
-    Uses gpiozero (same as original working code).
+    
+    Returns:
+        - lid_locked: Boolean indicating if lid is manually locked
+        - sensor_pin: GPIO pin number for lid sensor
+        - sensor_value: Current sensor reading (0=triggered, 1=not triggered)
+        - sensor_triggered: Boolean indicating if sensor is currently triggered
+        - note: Explanation of sensor behavior
+        - gpio_library: Name of GPIO library in use
     """
     try:
-        sensor = DigitalInputDevice(LID_SENSOR)
-        sensor_value = sensor.value
+        if MOCK == 0:
+            sensor_value = GPIO.gpio_read(controller, LID_SENSOR)
+        else:
+            sensor_value = 1  # Mock value - not triggered
     except Exception as e:
         sensor_value = f"error: {e}"
     
@@ -1066,7 +1124,7 @@ async def get_lid_status():
         "sensor_value": sensor_value,
         "sensor_triggered": sensor_value == 0 if isinstance(sensor_value, int) else False,
         "note": "sensor_value=0 means triggered (active low)",
-        "gpio_library": "gpiozero"
+        "gpio_library": "lgpio"
     }
 
 
@@ -1074,17 +1132,11 @@ async def get_lid_status():
 async def get_battery():
     """
     Get battery level as a percentage.
-
-    TODO: Hardware integration pending
-    - Read from battery management IC (e.g., MAX17048)
-    - Query voltage/percentage via I2C
-
-    Example implementation:
-        battery_voltage = read_battery_voltage()
-        battery_pct = voltage_to_percentage(battery_voltage)
-        return {"battery_percentage": battery_pct}
+    
+    Returns:
+        - battery_percentage: Float between 0-100
+        - status: Status string (mock/ok)
     """
-    # Mock data until hardware ready
     return {"battery_percentage": 87.3, "status": "mock-this would be replaced with a battery status reading"}
 
 
@@ -1092,18 +1144,14 @@ async def get_battery():
 async def move_to_dock(dock_id: Optional[str] = "D1"):
     """
     Command bin to move to specified dock.
-
-    TODO: Hardware integration pending
-    - Interface with motor controller
-    - Implement navigation logic
-    - Add obstacle detection
-
-    Example implementation:
-        await motor_controller.navigate_to_dock(dock_id)
-        await wait_for_docking_complete()
-        return {"status": "docked"}
+    
+    Args:
+        dock_id: Identifier of the target docking station (default: "D1")
+    
+    Returns:
+        - message: Status message
+        - dock_id: The dock ID that was targeted
     """
-    # Mock response until hardware ready
     return {
         "message": f"Would move to dock {dock_id}",
         "dock_id": dock_id,
@@ -1114,14 +1162,9 @@ async def move_to_dock(dock_id: Optional[str] = "D1"):
 async def motor_stop():
     """
     Emergency stop for motor movement.
-
-    TODO: Hardware integration pending
-    - Immediate motor cutoff
-    - Safety checks
-
-    Example implementation:
-        motor_controller.emergency_stop()
-        return {"status": "stopped"}
+    
+    Returns:
+        - message: Confirmation message
     """
     return {"message": "Would stop motor"}
 
@@ -1130,6 +1173,9 @@ async def motor_stop():
 async def door_open():
     """
     Command to open the side door.
+    
+    Returns:
+        - message: Status message indicating door action
     """
     retval = {}
     if MOCK:
@@ -1146,16 +1192,10 @@ async def door_open():
 async def door_close():
     """
     Command to close the door.
-
-    TODO: Hardware integration pending
-    - Interface with door actuator
-    - Implement safety checks
-
-    Example implementation:
-        await door_controller.close()
-        return {"status": "closed"}
+    
+    Returns:
+        - message: Status message indicating door action
     """
-    # I probably should ask if I just run the open_door function in reverse...
     return {"message": "Would close door"}
 
 
@@ -1163,42 +1203,144 @@ async def door_close():
 async def get_temperature():
     """
     Get internal temperature sensor reading.
+    
+    Returns:
+        - temperature_celsius: Float value of temperature in Celsius
+    
+    Errors:
+        - 503: Invalid temperature reading from sensor
+        - 504: Sensor read timeout (disconnected or malfunctioning)
+        - 500: Unexpected sensor error
     """
-    retval = {}
     if MOCK:
-        retval = {"temperature_celsius": 22.5}
-    else:
-        retval = {"temperature_celsius": dhtDevice.temp_c}
-    return retval
+        return {"temperature_celsius": 22.5}
+    
+    try:
+        loop = asyncio.get_event_loop()
+        
+        def read_temp():
+            with dht_lock:
+                time.sleep(0.1)
+                return dhtDevice.temperature
+        
+        temp = await asyncio.wait_for(
+            loop.run_in_executor(None, read_temp),
+            timeout=5.0
+        )
+        
+        if temp is None:
+            raise HTTPException(status_code=503, detail="Invalid temperature reading")
+        
+        return {"temperature_celsius": temp}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Temperature sensor read timed out")
+    except Exception as e:
+        logger.error(f"Error reading temperature: {e}")
+        raise HTTPException(status_code=500, detail=f"Sensor error: {str(e)}")
 
 
 @app.get("/api/v1/environment/humidity")
 async def get_humidity():
     """
     Get internal humidity sensor reading.
+    
+    Returns:
+        - humidity_relative: Float value of relative humidity (0-100%)
+    
+    Errors:
+        - 503: Invalid humidity reading from sensor
+        - 504: Sensor read timeout (disconnected or malfunctioning)
+        - 500: Unexpected sensor error
     """
-    retval = {}
     if MOCK:
-        retval = {"humidity_relative": 55.0}
-    else:
-        retval = {"humidity_relative": dhtDevice.humidity}
-    return retval
+        return {"humidity_relative": 55.0}
+    
+    try:
+        loop = asyncio.get_event_loop()
+        
+        def read_humidity():
+            with dht_lock:
+                time.sleep(0.1)
+                return dhtDevice.humidity
+        
+        humidity = await asyncio.wait_for(
+            loop.run_in_executor(None, read_humidity),
+            timeout=5.0
+        )
+        
+        if humidity is None:
+            raise HTTPException(status_code=503, detail="Invalid humidity reading")
+        
+        return {"humidity_relative": humidity}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Humidity sensor read timed out")
+    except Exception as e:
+        logger.error(f"Error reading humidity: {e}")
+        raise HTTPException(status_code=500, detail=f"Sensor error: {str(e)}")
 
 
 @app.get("/api/v1/environment")
 async def get_environment():
     """
-    Get internal sensor reading of the environment.
+    Get complete environmental sensor readings (temperature and humidity).
+    
+    Returns:
+        - temperature_celsius: Float value of temperature in Celsius
+        - humidity_relative: Float value of relative humidity (0-100%)
+        - status: String indicating mock or ok status
+    
+    Errors:
+        - 503: Sensor read failed or returned invalid data
+        - 504: Sensor read timeout (disconnected or malfunctioning)
+        - 500: Unexpected sensor error
     """
-    # retval = {}
-    # if MOCK:
-    #     retval = {"temperature_celsius": 22.5, "humidity_relative": 55.0}
-    # else:
-    retval = {
-            "temperature_celsius": dhtDevice.temp_c,
-            "humidity_relative": dhtDevice.humidity,
+    if MOCK:
+        return {
+            "temperature_celsius": 25.0,
+            "humidity_relative": 50.0,
+            "status": "mock"
         }
-    return retval
+    
+    try:
+        loop = asyncio.get_event_loop()
+        
+        def read_dht():
+            try:
+                with dht_lock:
+                    time.sleep(0.1)
+                    temp = dhtDevice.temperature
+                    humidity = dhtDevice.humidity
+                return temp, humidity
+            except RuntimeError as e:
+                logger.error(f"DHT11 read error: {e}")
+                return None, None
+        
+        temp, humidity = await asyncio.wait_for(
+            loop.run_in_executor(None, read_dht),
+            timeout=5.0
+        )
+        
+        if temp is None or humidity is None:
+            raise HTTPException(
+                status_code=503, 
+                detail="DHT11 sensor read failed or returned invalid data"
+            )
+        
+        return {
+            "temperature_celsius": temp,
+            "humidity_relative": humidity,
+            "status": "ok"
+        }
+        
+    except asyncio.TimeoutError:
+        logger.error("DHT11 read timed out after 5 seconds")
+        raise HTTPException(
+            status_code=504,
+            detail="DHT11 sensor read timed out - sensor may be disconnected"
+        )
+    except Exception as e:
+        logger.error(f"Error reading DHT11: {e}")
+        raise HTTPException(status_code=500, detail=f"Sensor error: {str(e)}")
 
 
 @app.get("/api/v1/signal-strength")
@@ -1213,6 +1355,9 @@ async def get_signal_strength():
     Example implementation:
         rssi = get_ble_rssi_to_master()
         return {"rssi": rssi}
+    
+    Returns:
+        - rssi: Integer RSSI value in dBm (typically -30 to -90)
     """
     retval = {}
     if MOCK:
@@ -1226,6 +1371,15 @@ async def get_signal_strength():
 
 @app.get("/")
 async def root():
+    """
+    API root endpoint showing service information.
+    
+    Returns:
+        - service: Service name
+        - version: API version string
+        - node: Bin ID of this node
+        - is_master: Boolean indicating if this node is cluster master
+    """
     return {
         "service": "Smart Bin API",
         "version": __VERSION__,
@@ -1236,6 +1390,14 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    """
+    Health check endpoint for monitoring service status.
+    
+    Returns:
+        - status: String indicating service health (healthy/unhealthy)
+        - background_tasks: Number of active background tasks
+        - tasks_running: List of running background task names
+    """
     return {
         "status": "healthy",
         "background_tasks": len(background_tasks),
@@ -1248,6 +1410,18 @@ async def preview_telemetry():
     """
     Preview the telemetry payload that will be sent to the webhook.
     Useful for debugging and monitoring.
+    
+    Returns:
+        - bin_id: This node's bin ID
+        - timestamp: ISO format timestamp
+        - fill_level: Current occupancy percentage
+        - battery: Battery level percentage
+        - signal_strength: RSSI value
+        - temperature: Temperature in Celsius
+        - humidity: Relative humidity percentage
+        - is_master: Boolean indicating if this node is master
+        - master_id: Cluster master bin ID
+        - cluster_id: Cluster identifier
     """
     current_temp = dhtDevice.temperature if MOCK == 0 else 25.0
     current_humidity = dhtDevice.humidity if MOCK == 0 else 50.0
@@ -1284,7 +1458,7 @@ async def preview_telemetry():
             slave_telemetry = {
                 "bin_id": slave_id,
                 "timestamp": datetime.utcnow().isoformat(),
-                "fill_level": 50.0,
+                "fill_level": 50.0,#mock data for now
                 "battery": 85.0,
                 "signal_strength": -60,
                 "temperature": 24.0,
@@ -1292,7 +1466,7 @@ async def preview_telemetry():
                 "is_master": False,
                 "master_id": node_state["bin_id"],
                 "cluster_id": node_state["cluster_id"],
-                "location": f"Warehouse A - Slave",
+                #"location": f"Warehouse A - Slave",
             }
             telemetry_payload["slave_nodes"].append(slave_telemetry)
     
