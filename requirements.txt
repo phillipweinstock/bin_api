@@ -7,6 +7,7 @@ requests
 
 # Hardware libraries (Mandatory for actual hardware, mocking for development only)
 # These will fail gracefully on non-Raspberry Pi systems
+RPi.GPIO; platform_machine == "aarch64" or platform_machine == "armv7l"
 adafruit-circuitpython-servokit; platform_machine == "aarch64" or platform_machine == "armv7l"
 gpiozero; platform_machine == "aarch64" or platform_machine == "armv7l"
 git+https://github.com/pololu/motoron-python.git; platform_machine == "aarch64" or platform_machine == "armv7l"

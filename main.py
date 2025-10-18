@@ -49,6 +49,18 @@ try:
     import spidev
     from adafruit_servokit import ServoKit
     from dbus_next.aio import MessageBus
+    
+    # Import gpiozero and configure it to use RPi.GPIO to avoid lgpio conflicts
+    import gpiozero
+    try:
+        # Try to use RPi.GPIO backend to avoid conflicts with our lgpio usage
+        from gpiozero.pins.rpigpio import RPiGPIOFactory
+        gpiozero.Device.pin_factory = RPiGPIOFactory()
+        logger.info("gpiozero configured to use RPi.GPIO backend")
+    except ImportError:
+        # RPi.GPIO not available, use native backend but warn about potential conflicts
+        logger.warning("RPi.GPIO not available, gpiozero will use default backend (may conflict with lgpio)")
+    
     from gpiozero import DigitalInputDevice
 
     logger.info("Hardware libraries imported successfully")
