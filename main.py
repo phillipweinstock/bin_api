@@ -301,35 +301,73 @@ async def get_distance():
     logger.info("Getting distance measurement")
     
     def blocking_gpio_read():
-        GPIO.gpio_write(controller, TRIG, 0)
-        time.sleep(0.002)
-        GPIO.gpio_write(controller, TRIG, 1)
-        time.sleep(0.00001)
-        GPIO.gpio_write(controller, TRIG, 0)
+        encL_cb_backup, encR_cb_backup = None, None
+        if MOCK == 0 and encL is not None and encR is not None:
+            try:
+                # Remove encoder callbacks temporarily
+                GPIO.callback(controller, LEFT_A, GPIO.BOTH_EDGES, None)
+                GPIO.callback(controller, LEFT_B, GPIO.BOTH_EDGES, None)
+                GPIO.callback(controller, RIGHT_A, GPIO.BOTH_EDGES, None)
+                GPIO.callback(controller, RIGHT_B, GPIO.BOTH_EDGES, None)
+            except Exception as e:
+                logger.debug(f"Could not disable encoder callbacks: {e}")
         
-        time_start = time.time()
-        
-        while GPIO.gpio_read(controller, ECHO) == 0:
-            pulse_start = time.time()
-            if time.time() - time_start > TIMEOUT:
-                logger.warning("Timeout waiting for ECHO HIGH")
+        try:
+            # Check initial state
+            initial_echo = GPIO.gpio_read(controller, ECHO)
+            logger.debug(f"ECHO initial state: {initial_echo}")
+            
+            GPIO.gpio_write(controller, TRIG, 0)
+            time.sleep(0.002)
+            GPIO.gpio_write(controller, TRIG, 1)
+            time.sleep(0.00001)
+            GPIO.gpio_write(controller, TRIG, 0)
+            
+            time_start = time.time()
+            pulse_start = time_start
+            pulse_end = time_start
+            
+            wait_count = 0
+            while GPIO.gpio_read(controller, ECHO) == 0:
+                pulse_start = time.time()
+                wait_count += 1
+                if time.time() - time_start > TIMEOUT:
+                    logger.warning(f"Timeout waiting for ECHO HIGH (checked {wait_count} times)")
+                    return None
+            
+            logger.debug(f"ECHO went HIGH after {wait_count} checks, duration: {pulse_start - time_start:.6f}s")
+            
+
+            wait_count = 0
+            while GPIO.gpio_read(controller, ECHO) == 1:
+                pulse_end = time.time()
+                wait_count += 1
+                if time.time() - time_start > TIMEOUT:
+                    echo_duration = pulse_end - pulse_start
+                    logger.warning(f"Timeout waiting for ECHO LOW (checked {wait_count} times, pulse duration so far: {echo_duration:.6f}s)")
+                    return None
+            
+            logger.debug(f"ECHO went LOW after {wait_count} checks")
+            
+            duration = pulse_end - pulse_start
+            distance = duration * 17150
+            
+            if distance < MIN_DISTANCE or distance > MAX_DISTANCE:
+                logger.warning(f"Distance out of range: {distance} cm")
                 return None
-        
-        while GPIO.gpio_read(controller, ECHO) == 1:
-            pulse_end = time.time()
-            if time.time() - time_start > TIMEOUT:
-                logger.warning("Timeout waiting for ECHO LOW")
-                return None
-        
-        duration = pulse_end - pulse_start
-        distance = duration * 17150
-        
-        if distance < MIN_DISTANCE or distance > MAX_DISTANCE:
-            logger.warning(f"Distance out of range: {distance} cm")
-            return None
-        
-        logger.info(f"Distance measured: {distance} cm")
-        return round(distance, 2)
+            
+            logger.info(f"Distance measured: {distance} cm")
+            return round(distance, 2)
+        finally:
+            # Re-enable encoder callbacks
+            if MOCK == 0 and encL is not None and encR is not None:
+                try:
+                    GPIO.callback(controller, LEFT_A, GPIO.BOTH_EDGES, encL._cb)
+                    GPIO.callback(controller, LEFT_B, GPIO.BOTH_EDGES, encL._cb)
+                    GPIO.callback(controller, RIGHT_A, GPIO.BOTH_EDGES, encR._cb)
+                    GPIO.callback(controller, RIGHT_B, GPIO.BOTH_EDGES, encR._cb)
+                except Exception as e:
+                    logger.error(f"Could not re-enable encoder callbacks: {e}")
     
     try:
         loop = asyncio.get_event_loop()
@@ -820,6 +858,8 @@ async def startup_event():
             raise
         
         try:
+            logger.info(f"Attempting to initialize encoders on pins L({LEFT_A},{LEFT_B}) R({RIGHT_A},{RIGHT_B})")
+            
             class QuadCounter:
                 # State transition lookup table: (last, curr) -> +1 / -1 / 0
                 TRANS = {
@@ -828,19 +868,25 @@ async def startup_event():
                 }
 
                 def __init__(self, h, a, b, name="enc"):
+                    logger.info(f"QuadCounter.__init__ called for {name} on pins ({a},{b})")
                     self.h = h
                     self.a, self.b = a, b
                     self.name = name
                     self.pos = 0
+                    logger.debug(f"{name}: Claiming input pins")
                     GPIO.gpio_claim_input(h, a)
                     GPIO.gpio_claim_input(h, b)
+                    logger.debug(f"{name}: Setting up alerts")
                     GPIO.gpio_claim_alert(h, a, GPIO.RISING_EDGE | GPIO.FALLING_EDGE)
                     GPIO.gpio_claim_alert(h, b, GPIO.RISING_EDGE | GPIO.FALLING_EDGE)
+                    logger.debug(f"{name}: Reading initial state")
                     self.last = ((GPIO.gpio_read(h, a) & 1) << 1) | (GPIO.gpio_read(h, b) & 1)
+                    logger.debug(f"{name}: Setting up callbacks")
                     GPIO.callback(h, a, GPIO.BOTH_EDGES, self._cb)
                     GPIO.callback(h, b, GPIO.BOTH_EDGES, self._cb)
                     self.writer_ev = None
-                    self._fev = None  
+                    self._fev = None
+                    logger.info(f"{name} initialized successfully")
 
                 def bind_event_writer(self, writer, file_handle):
                     """Bind a CSV writer for event logging (used inside callback)."""
@@ -863,11 +909,13 @@ async def startup_event():
                     self.last = curr
             
             global encL, encR
+            logger.info("Creating left encoder...")
             encL = QuadCounter(controller, LEFT_A, LEFT_B, name="LeftEncoder")
+            logger.info("Creating right encoder...")
             encR = QuadCounter(controller, RIGHT_A, RIGHT_B, name="RightEncoder")
-            logger.info("Encoders initialized")
+            logger.info(f"Encoders initialized: encL={encL}, encR={encR}")
         except Exception as e:
-            logger.error(f"Error during Encoder initialization: {e}")
+            logger.error(f"Error during Encoder initialization: {e}", exc_info=True)
             raise
 
     
@@ -1344,6 +1392,8 @@ async def record_motor_path(name: str):
         background_tasks.remove(asyncio.current_task())
         return
     
+    os.makedirs("motor_paths", exist_ok=True)
+    
     if os.path.exists(f"motor_paths/events_{name}.csv"):
         logger.warning(f"Motor path events {name} already exists and will be overwritten.")
         os.remove(f"motor_paths/events_{name}.csv")
@@ -1489,7 +1539,10 @@ async def stop_recording_path():
     for task in background_tasks:
         if task.get_coro().__name__ == "record_motor_path":
             task.cancel()
-            await task
+            try:
+                await task
+            except asyncio.CancelledError:
+                logger.info("Motor path recording task cancelled successfully")
             return {
                 "message": "Stopped recording motor path and saved data",
             }
