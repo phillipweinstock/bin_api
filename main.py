@@ -16,11 +16,17 @@ from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-if platform.system() == "Windows":
-    log_file_path = "C:/temp/bin_api.log"
-    os.makedirs("C:/temp", exist_ok=True)
+USE_TEMP_LOG = True
+
+if USE_TEMP_LOG:
+    if platform.system() == "Windows":
+        log_file_path = "C:/temp/bin_api.log"
+        os.makedirs("C:/temp", exist_ok=True)
+    else:
+        log_file_path = "/tmp/bin_api.log"
 else:
-    log_file_path = "/tmp/bin_api.log"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_file_path = os.path.join(script_dir, "bin_api.log")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,8 +35,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 __VERSION__ = "1.0.0"
-logger.info(f"Starting Smart Bin API v{__VERSION__}")
+logger.info(f"Starting Smart Bin v{__VERSION__}")
 MOCK = 0
+# Ultrasonic Lid/Avoidance constants
 TRIG = 22
 ECHO = 16
 LID_SENSOR = 26  # GPIO pin for lid sensor (active low)
@@ -38,10 +45,26 @@ MAX_DISTANCE = 20.0
 MIN_DISTANCE = 9.0
 TIMEOUT = 0.02  # 20 ms timeout
 SAMPLE_COUNT = 5
+# Encoder constants & objects
+encL, encR = None, None
+LEFT_A, LEFT_B  = 23, 24
+RIGHT_A, RIGHT_B = 27, 25
+SAMPLE_HZ = 100  # Fixed sampling frequency (recommended 50–200 Hz)
+MAX_PWM = 800
+ACC = 150
+DEC = 150
+SPEED_SCALE = 13
+SMOOTH_ALPHA = 0.5
+MIN_DT = 0.005
+MOTOR_DIR_L = -1
+MOTOR_DIR_R = -1
+# Global state & configuration
 CURRENT_OCCUPANCY = 0.0
 MANUAL_CLUSTER_RENAME = False
 LID_LOCKED = False
 WEBHOOK = "http://172.26.59.116:3000/api/bin-status"
+
+
 try:
     import adafruit_dht
     import board
@@ -212,18 +235,18 @@ except ImportError as e:
 
 # Initialize hardware components (real or mock)
 # NOTE: GPIO initialization is deferred to startup event to avoid import-time conflicts
-controller = None  # Will be initialized in startup_event
+controller = None 
 
 if MOCK == 0:
     logger.info("Initializing real hardware components (GPIO deferred to startup)")
     dhtDevice = adafruit_dht.DHT11(board.D17)
-    motor_controller = motoron.MotoronI2C(address=0x58)
+    motor_controller = motoron.MotoronI2C()
     spi = spidev.SpiDev()
     spi.open(0, 0)  # Open SPI bus 0, device 0
     kit = ServoKit(channels=16)
-    
-    # GPIO will be initialized in startup_event to avoid import-time claiming
-    
+    #wifi = WifiController() implement later
+    # forward declare controller
+
     class WifiController:
         def __init__(self,interface='wlan0'):
             self.interface=interface
@@ -240,9 +263,21 @@ if MOCK == 0:
             status=self.run("rfkill","list","wifi")
             return "Soft blocked: no" in status and "Hard blocked: no" in status
     wifi = WifiController()
+    
+    
 else:
     logger.info("Initializing mock hardware components")
-    dhtDevice = adafruit_dht.DHT11(None)
+    
+    class MockDHT11:
+        @property
+        def temperature(self):
+            return 22.5
+        
+        @property
+        def humidity(self):
+            return 55.0
+    
+    dhtDevice = MockDHT11()
     motor_controller = Motoron(address=0x58)
     spi = spidev.SpiDev()
     spi.open(0, 0)
@@ -259,35 +294,56 @@ app = FastAPI(
 )
 
 background_tasks = set()
-
 dht_lock = threading.Lock()
 
 
 async def get_distance():
     logger.info("Getting distance measurement")
-    GPIO.gpio_write(controller, TRIG, 0)
-    await asyncio.sleep(0.002)
-    GPIO.gpio_write(controller, TRIG, 1)
-    await asyncio.sleep(0.00001)
-    time_start = time.time()
-    while GPIO.gpio_read(controller, ECHO) == 0:
-        pulse_start = time.time()
-        if time.time() - time_start > TIMEOUT:
-            logger.warning("Timeout waiting for ECHO HIGH")
+    
+    def blocking_gpio_read():
+        GPIO.gpio_write(controller, TRIG, 0)
+        time.sleep(0.002)
+        GPIO.gpio_write(controller, TRIG, 1)
+        time.sleep(0.00001)
+        GPIO.gpio_write(controller, TRIG, 0)
+        
+        time_start = time.time()
+        
+        while GPIO.gpio_read(controller, ECHO) == 0:
+            pulse_start = time.time()
+            if time.time() - time_start > TIMEOUT:
+                logger.warning("Timeout waiting for ECHO HIGH")
+                return None
+        
+        while GPIO.gpio_read(controller, ECHO) == 1:
+            pulse_end = time.time()
+            if time.time() - time_start > TIMEOUT:
+                logger.warning("Timeout waiting for ECHO LOW")
+                return None
+        
+        duration = pulse_end - pulse_start
+        distance = duration * 17150
+        
+        if distance < MIN_DISTANCE or distance > MAX_DISTANCE:
+            logger.warning(f"Distance out of range: {distance} cm")
             return None
-    while GPIO.gpio_read(controller, ECHO) == 1:
-        pulse_end = time.time()
-        if time.time() - time_start > TIMEOUT:
-            logger.warning("Timeout waiting for ECHO LOW")
-            return None
-    duration = pulse_end - pulse_start
-    distance = duration * 17150  # Calculate distance in cm
-    if distance < MIN_DISTANCE or distance > MAX_DISTANCE:
-        logger.warning(f"Distance out of range: {distance} cm")
+        
+        logger.info(f"Distance measured: {distance} cm")
+        return round(distance, 2)
+    
+    try:
+        loop = asyncio.get_event_loop()
+        distance = await asyncio.wait_for(
+            loop.run_in_executor(None, blocking_gpio_read),
+            timeout=2.0
+        )
+        return distance
+    except asyncio.TimeoutError:
+        logger.error("Ultrasonic sensor read timed out")
         return None
-    logger.info(f"Distance measured: {distance} cm")
-    return round(distance, 2)
-
+    except Exception as e:
+        logger.error(f"Error reading ultrasonic sensor: {e}")
+        return None
 
 async def get_median_distance(samples=SAMPLE_COUNT):
     logger.info(f"Getting median distance from {samples} samples")
@@ -304,7 +360,6 @@ async def get_median_distance(samples=SAMPLE_COUNT):
     logger.info(f"Median distance from {samples} samples: {median_dist} cm")
     return round(median_dist, 2)
 
-
 async def compute_occupancy(distance):
     if distance is None:
         return None
@@ -316,7 +371,6 @@ async def compute_occupancy(distance):
         (MAX_DISTANCE - distance) / (MAX_DISTANCE - MIN_DISTANCE)
     ) * 100  # not the same as Cleo's
     return round(occupancy, 2)
-
 
 async def occupancy_monitoring_task():
     logging.info("Occupancy monitoring task started")
@@ -339,11 +393,9 @@ async def occupancy_monitoring_task():
     finally:
         background_tasks.remove(asyncio.current_task())
 
-
 async def lid_control_task():
     """
     Control lid using servo on channel 10.
-    Uses lgpio for sensor reading (RPi5 compatible).
     """
     background_tasks.add(asyncio.current_task())
     
@@ -356,7 +408,7 @@ async def lid_control_task():
                 # Set up GPIO 26 as input with pull-up resistor (sensor is active low)
                 GPIO.gpio_claim_input(controller, LID_SENSOR, GPIO.SET_PULL_UP)
                 lid_sensor_gpio = LID_SENSOR
-                logger.info(f"Lid sensor initialized on GPIO {LID_SENSOR} using lgpio")
+                logger.info(f"Lid sensor initialized on GPIO {LID_SENSOR}")
             except Exception as e:
                 logger.error(f"Failed to initialize lid sensor on GPIO {LID_SENSOR}: {e}")
                 logger.warning("Lid sensor disabled - continuing without it")
@@ -376,10 +428,8 @@ async def lid_control_task():
                     continue
                 
                 if lid_sensor_gpio is not None:
-                    # Read sensor using lgpio (active low - 0 = triggered)
                     sensor_value = GPIO.gpio_read(controller, lid_sensor_gpio)
                     
-                    # Log sensor state changes for debugging
                     if sensor_value != last_sensor_state:
                         logger.debug(f"Lid sensor state changed: {last_sensor_state} -> {sensor_value}")
                         last_sensor_state = sensor_value
@@ -392,7 +442,7 @@ async def lid_control_task():
                         logging.info("Closing lid...")
                         with dht_lock:
                             servo.angle = 0
-                        await asyncio.sleep(1)  # Debounce
+                        await asyncio.sleep(1)  
                     else:
                         with dht_lock:
                             servo.angle = 0
@@ -407,7 +457,7 @@ async def lid_control_task():
                 raise
             except Exception as e:
                 logger.error(f"Error in lid control task: {e}")
-                await asyncio.sleep(1)  # Brief pause before retry
+                await asyncio.sleep(1)  
     finally:
         background_tasks.remove(asyncio.current_task())
 
@@ -710,6 +760,18 @@ async def periodic_discovery():
     finally:
         background_tasks.remove(asyncio.current_task())
 
+async def coast_motors():
+    try:
+
+        motor_controller.reinitialize()
+        motor_controller.clear_reset_flag()
+        motor_controller.set_braking(1, 0)
+        motor_controller.set_braking(2, 0)
+        motor_controller.coast_now()
+        motor_controller.set_command_timeout_milliseconds(100)
+        logger.info("Encoders set to Coast mode")
+    except Exception as e:
+        logger.error(f"Motoron not set to Coast (possibly not connected or library missing): {e}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -727,6 +789,7 @@ async def startup_event():
     if MOCK == 0:
         logger.info("Initializing GPIO pins...")
         controller = GPIO.gpiochip_open(0)
+        
         
         # Free GPIO pins if they're already claimed (cleanup from previous run)
         try:
@@ -755,6 +818,58 @@ async def startup_event():
         except Exception as e:
             logger.error(f"Failed to claim GPIO pin {ECHO}: {e}")
             raise
+        
+        try:
+            class QuadCounter:
+                # State transition lookup table: (last, curr) -> +1 / -1 / 0
+                TRANS = {
+                    (0,1):+1,(1,3):+1,(3,2):+1,(2,0):+1,
+                    (1,0):-1,(3,1):-1,(2,3):-1,(0,2):-1
+                }
+
+                def __init__(self, h, a, b, name="enc"):
+                    self.h = h
+                    self.a, self.b = a, b
+                    self.name = name
+                    self.pos = 0
+                    GPIO.gpio_claim_input(h, a)
+                    GPIO.gpio_claim_input(h, b)
+                    GPIO.gpio_claim_alert(h, a, GPIO.RISING_EDGE | GPIO.FALLING_EDGE)
+                    GPIO.gpio_claim_alert(h, b, GPIO.RISING_EDGE | GPIO.FALLING_EDGE)
+                    self.last = ((GPIO.gpio_read(h, a) & 1) << 1) | (GPIO.gpio_read(h, b) & 1)
+                    GPIO.callback(h, a, GPIO.BOTH_EDGES, self._cb)
+                    GPIO.callback(h, b, GPIO.BOTH_EDGES, self._cb)
+                    self.writer_ev = None
+                    self._fev = None  
+
+                def bind_event_writer(self, writer, file_handle):
+                    """Bind a CSV writer for event logging (used inside callback)."""
+                    self.writer_ev = writer
+                    self._fev = file_handle
+
+                def _cb(self, chip, gpio, level, tick):
+                    """Interrupt callback — handles both edges on A/B and updates position."""
+                    curr = ((GPIO.gpio_read(self.h, self.a) & 1) << 1) | (GPIO.gpio_read(self.h, self.b) & 1)
+                    delta = self.TRANS.get((self.last, curr), 0)
+                    if delta:
+                        self.pos += delta
+                        if self.writer_ev:
+                            t_us = time.monotonic_ns() // 1_000
+                            a_lvl = (curr >> 1) & 1
+                            b_lvl = curr & 1
+                            self.writer_ev.writerow([t_us, self.name, a_lvl, b_lvl, delta, self.pos])
+                            if self._fev:
+                                self._fev.flush()
+                    self.last = curr
+            
+            global encL, encR
+            encL = QuadCounter(controller, LEFT_A, LEFT_B, name="LeftEncoder")
+            encR = QuadCounter(controller, RIGHT_A, RIGHT_B, name="RightEncoder")
+            logger.info("Encoders initialized")
+        except Exception as e:
+            logger.error(f"Error during Encoder initialization: {e}")
+            raise
+
     
     logging.info(f"Starting {node_state['bin_id']}...")
     logging.info(f"Cluster: {node_state['cluster_id']}")
@@ -1139,11 +1254,6 @@ async def unregister_node(bin_id: str):
         ),
     }
 
-    return {
-        "status": "unregistered",
-        "bin_id": bin_id,
-        "remaining_nodes": len(node_state["discovered_nodes"]),
-    }
 
 
 @app.get("/api/v1/occupancy")
@@ -1175,7 +1285,6 @@ async def get_lid_status():
         - sensor_value: Current sensor reading (0=triggered, 1=not triggered)
         - sensor_triggered: Boolean indicating if sensor is currently triggered
         - note: Explanation of sensor behavior
-        - gpio_library: Name of GPIO library in use
     
     Example Response:
         ```json
@@ -1184,8 +1293,7 @@ async def get_lid_status():
             "sensor_pin": 26,
             "sensor_value": 1,
             "sensor_triggered": false,
-            "note": "sensor_value=0 means triggered (active low)",
-            "gpio_library": "lgpio"
+            "note": "sensor_value=0 means triggered (active low)"
         }
         ```
     """
@@ -1202,8 +1310,7 @@ async def get_lid_status():
         "sensor_pin": LID_SENSOR,
         "sensor_value": sensor_value,
         "sensor_triggered": sensor_value == 0 if isinstance(sensor_value, int) else False,
-        "note": "sensor_value=0 means triggered (active low)",
-        "gpio_library": "lgpio"
+        "note": "sensor_value=0 means triggered (active low)"
     }
 
 
@@ -1226,24 +1333,204 @@ async def get_battery():
     """
     return {"battery_percentage": 87.3, "status": "mock-this would be replaced with a battery status reading"}
 
+async def record_motor_path(name: str):
+    """
+    Record motor path for the specified motor.
+    This is a placeholder implementation.
+    """
+    background_tasks.add(asyncio.current_task())
+    if MOCK:
+        logger.info("Mock mode - skipping motor path recording")
+        background_tasks.remove(asyncio.current_task())
+        return
+    
+    if os.path.exists(f"motor_paths/events_{name}.csv"):
+        logger.warning(f"Motor path events {name} already exists and will be overwritten.")
+        os.remove(f"motor_paths/events_{name}.csv")
+    if os.path.exists(f"motor_paths/samples_{name}.csv"):
+        logger.warning(f"Motor path samples {name} already exists and will be overwritten.")
+        os.remove(f"motor_paths/samples_{name}.csv")
+        
+    events = open(f"motor_paths/events_{name}.csv", "w", newline="")
+    positions = open(f"motor_paths/samples_{name}.csv", "w", newline="")
+    events_writer = csv.writer(events)
+    events_writer.writerow(["t_us","enc","A","B","delta","pos"])
+    positions_writer = csv.writer(positions)
+    positions_writer.writerow(["t_us","left_pos","right_pos"])
 
+    logger.info(f"Recording motor path for {name}")
+    encL.bind_event_writer(events_writer, events)
+    encR.bind_event_writer(events_writer, events)
+    period = 1.0 / SAMPLE_HZ
+    try:
+        while True:
+            t_us = time.monotonic_ns() // 1_000
+            positions_writer.writerow([t_us, encL.pos, encR.pos])
+            positions.flush()
+            await asyncio.sleep(period)
+    except asyncio.CancelledError:
+        logger.info(f"Recording task for {name} stopped, saving path...")
+    finally:
+        events.flush()
+        positions.flush()
+        events.close()
+        positions.close()
+        encL.bind_event_writer(None, None)
+        encR.bind_event_writer(None, None)
+        logger.info(f"Motor path recording for {name} saved and closed")
+        background_tasks.discard(asyncio.current_task())
+
+async def play_motor_path(name: str, reverse: bool = False):
+    """
+    Play back recorded motor path for the specified motor.
+    This is a placeholder implementation.
+    """
+    def clamp(value, min_value, max_value):
+        return max(min_value, min(value, max_value))
+    
+    background_tasks.add(asyncio.current_task())
+    if MOCK:
+        logger.info("Mock mode - skipping motor path playback")
+        background_tasks.remove(asyncio.current_task())
+        return
+    
+    events_file = f"motor_paths/events_{name}.csv"
+    samples_file = f"motor_paths/samples_{name}.csv"
+    if not os.path.exists(events_file) or not os.path.exists(samples_file):
+        logger.error(f"Motor path files for {name} not found.")
+        background_tasks.remove(asyncio.current_task())
+        return
+
+    logger.info(f"Playing back motor path for {name} (Going to dock={reverse})")
+    sample_rows = []
+    with open(samples_file, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            t = int(row["t_us"])
+            L = int(row["left_pos"])
+            R = int(row["right_pos"])
+            sample_rows.append((t, L, R))
+        if len(sample_rows) < 2:
+            logger.error(f"No samples found in {samples_file}")
+            background_tasks.remove(asyncio.current_task())
+            return
+    vL_prev, vR_prev = 0, 0
+    if reverse:
+        sample_rows = list(reversed(sample_rows))
+    try:
+        motor_controller.set_speed(1,0)
+        motor_controller.set_speed(2,0)
+        await asyncio.sleep(0.2)
+
+        for i in range(1, len(sample_rows)):
+            t0,L0,R0 = sample_rows[i-1]
+            t1,L1,R1 = sample_rows[i]
+            dt =max((t1 - t0)/1_000, MIN_DT)
+            dL = (L1 - L0)
+            dR = (R1 - R0)
+            if reverse:
+                dL = -dL
+                dR = -dR
+            dL *= MOTOR_DIR_L
+            dR *= MOTOR_DIR_R
+            vL = clamp(int(dL* SPEED_SCALE), -MAX_PWM, MAX_PWM)
+            vR = clamp(int(dR* SPEED_SCALE), -MAX_PWM, MAX_PWM)
+            if SMOOTH_ALPHA > 0.0:
+                vL_cmd = int((1.0 - SMOOTH_ALPHA) * vL_prev + SMOOTH_ALPHA * vL_cmd)
+                vR_cmd = int((1.0 - SMOOTH_ALPHA) * vR_prev + SMOOTH_ALPHA * vR_cmd)
+            motor_controller.set_speed(1, vL_cmd)
+            motor_controller.set_speed(2, vR_cmd)
+            vL_prev = vL_cmd
+            vR_prev = vR_cmd
+            await asyncio.sleep(dt)
+        motor_controller.set_speed(1,0)
+        motor_controller.set_speed(2,0)
+        await asyncio.sleep(0.2)
+        motor_controller.coast_now()
+        logger.info("Motors set to coast after playback")
+        logger.info(f"Path replay for {name} completed")
+
+
+    except asyncio.CancelledError:
+        logger.info(f"Motor path playback for {name} cancelled, stopping motors...")
+        motor_controller.set_speed(1,0)
+        motor_controller.set_speed(2,0)
+        motor_controller.coast_now()
+        background_tasks.remove(asyncio.current_task())
+        return
+    finally:
+        await asyncio.sleep(0.2)
+        background_tasks.remove(asyncio.current_task())
+        return
+
+
+
+@app.post("/api/v1/motor/record_path/start")
+async def start_recording_path(name: Optional[str] = "default_path"):
+    """
+    Command to start recording the path for a specific motor.
+    
+    Returns:
+        - message: Status message indicating recording has started
+        - name: The name of the motor being recorded
+    """
+    task = asyncio.create_task(record_motor_path(name))
+    return {
+        "message": f"Started recording for {name}, call /stop to finish and save the path",
+    }
+@app.post("/api/v1/motor/record_path/stop")
+async def stop_recording_path():
+    """
+    Command to stop recording the motor path.
+    
+    Returns:
+        - message: Status message indicating recording has stopped
+    """
+    for task in background_tasks:
+        if task.get_coro().__name__ == "record_motor_path":
+            task.cancel()
+            await task
+            return {
+                "message": "Stopped recording motor path and saved data",
+            }
+    return {
+        "message": "No active motor path recording found",
+    }
 @app.post("/api/v1/motor/dock")
-async def move_to_dock(dock_id: Optional[str] = "D1"):
+async def move_to_dock(dock_id: Optional[str] = "default_path"):
     """
     Command bin to move to specified dock.
     
     Args:
-        dock_id: Identifier of the target docking station (default: "D1")
+        dock_id: Identifier of the target docking station (default: "default_path")
     
     Returns:
-        - message: Status message
+        - message: Status message indicating playback has started
         - dock_id: The dock ID that was targeted
     """
+    task = asyncio.create_task(play_motor_path(dock_id,reverse=True))
     return {
         "message": f"Would move to dock {dock_id}",
         "dock_id": dock_id,
     }
 
+@app.post("/api/v1/motor/return")
+async def return_from_dock(dock_id: Optional[str] = "default_path"):
+    """
+    Command bin to return from specified dock.
+    
+    Args:
+        dock_id: Identifier of the docking station to return from (default: "default_path")
+    
+    Returns:
+        - message: Status message indicating playback has started
+        - dock_id: The dock ID that was targeted
+    """
+    task = asyncio.create_task(play_motor_path(dock_id,reverse=False))
+    return {
+        "message": f"Would return from dock {dock_id}",
+        "dock_id": dock_id,
+    }
 
 @app.post("/api/v1/motor/stop")
 async def motor_stop():
@@ -1260,7 +1547,12 @@ async def motor_stop():
         }
         ```
     """
-    return {"message": "Would stop motor"}
+    for task in background_tasks:
+        if task.get_coro().__name__ == "play_motor_path":
+            task.cancel()
+            await task
+
+    return {"message": "motor stopped"}
 
 
 @app.post("/api/v1/door/open")
@@ -1278,13 +1570,7 @@ async def door_open():
         }
         ```
     """
-    retval = {}
-    if MOCK:
-        retval = {"message": "Would open side door"}
-    else:
-
-        retval = {"message": "Side door opened"}
-
+    retval = {"message": "Side door opened"}
     task = asyncio.create_task(open_door())
     return retval
 
@@ -1327,31 +1613,7 @@ async def get_temperature():
         }
         ```
     """
-    if MOCK:
-        return {"temperature_celsius": 22.5}
-    
-    try:
-        loop = asyncio.get_event_loop()
-        
-        def read_temp():
-            with dht_lock:
-                time.sleep(0.1)
-                return dhtDevice.temperature
-        
-        temp = await asyncio.wait_for(
-            loop.run_in_executor(None, read_temp),
-            timeout=5.0
-        )
-        
-        if temp is None:
-            raise HTTPException(status_code=503, detail="Invalid temperature reading")
-        
-        return {"temperature_celsius": temp}
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Temperature sensor read timed out")
-    except Exception as e:
-        logger.error(f"Error reading temperature: {e}")
-        raise HTTPException(status_code=500, detail=f"Sensor error: {str(e)}")
+    return {"temperature_celsius": 22.5}
 
 
 @app.get("/api/v1/environment/humidity")
@@ -1374,31 +1636,7 @@ async def get_humidity():
         }
         ```
     """
-    if MOCK:
-        return {"humidity_relative": 55.0}
-    
-    try:
-        loop = asyncio.get_event_loop()
-        
-        def read_humidity():
-            with dht_lock:
-                time.sleep(0.1)
-                return dhtDevice.humidity
-        
-        humidity = await asyncio.wait_for(
-            loop.run_in_executor(None, read_humidity),
-            timeout=5.0
-        )
-        
-        if humidity is None:
-            raise HTTPException(status_code=503, detail="Invalid humidity reading")
-        
-        return {"humidity_relative": humidity}
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Humidity sensor read timed out")
-    except Exception as e:
-        logger.error(f"Error reading humidity: {e}")
-        raise HTTPException(status_code=500, detail=f"Sensor error: {str(e)}")
+    return {"humidity_relative": 55.0}
 
 
 @app.get("/api/v1/environment")
@@ -1425,53 +1663,11 @@ async def get_environment():
         }
         ```
     """
-    if MOCK:
-        return {
-            "temperature_celsius": 25.0,
-            "humidity_relative": 50.0,
-            "status": "mock"
-        }
-    
-    try:
-        loop = asyncio.get_event_loop()
-        
-        def read_dht():
-            try:
-                with dht_lock:
-                    time.sleep(0.1)
-                    temp = dhtDevice.temperature
-                    humidity = dhtDevice.humidity
-                return temp, humidity
-            except RuntimeError as e:
-                logger.error(f"DHT11 read error: {e}")
-                return None, None
-        
-        temp, humidity = await asyncio.wait_for(
-            loop.run_in_executor(None, read_dht),
-            timeout=5.0
-        )
-        
-        if temp is None or humidity is None:
-            raise HTTPException(
-                status_code=503, 
-                detail="DHT11 sensor read failed or returned invalid data"
-            )
-        
-        return {
-            "temperature_celsius": temp,
-            "humidity_relative": humidity,
-            "status": "ok"
-        }
-        
-    except asyncio.TimeoutError:
-        logger.error("DHT11 read timed out after 5 seconds")
-        raise HTTPException(
-            status_code=504,
-            detail="DHT11 sensor read timed out - sensor may be disconnected"
-        )
-    except Exception as e:
-        logger.error(f"Error reading DHT11: {e}")
-        raise HTTPException(status_code=500, detail=f"Sensor error: {str(e)}")
+    return {
+        "temperature_celsius": 25.0,
+        "humidity_relative": 50.0,
+        "status": "mock"
+    }
 
 
 @app.get("/api/v1/signal-strength")
@@ -1596,8 +1792,8 @@ async def preview_telemetry():
         }
         ```
     """
-    current_temp = dhtDevice.temperature if MOCK == 0 else 25.0
-    current_humidity = dhtDevice.humidity if MOCK == 0 else 50.0
+    current_temp = 25.0
+    current_humidity = 50.0
     
     this_node_telemetry = {
         "bin_id": node_state["bin_id"],
