@@ -29,7 +29,7 @@ else:
     log_file_path = os.path.join(script_dir, "bin_api.log")
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(levelname)s - %(asctime)s - %(name)s - %(message)s",
     handlers=[logging.StreamHandler(), logging.FileHandler(log_file_path)],
 )
@@ -53,11 +53,13 @@ SAMPLE_HZ = 100  # Fixed sampling frequency (recommended 50–200 Hz)
 MAX_PWM = 800
 ACC = 150
 DEC = 150
-SPEED_SCALE = 13
+SPEED_SCALE = 13   #( 100-300)
 SMOOTH_ALPHA = 0.5
 MIN_DT = 0.005
 MOTOR_DIR_L = -1
 MOTOR_DIR_R = -1
+STATIONARY_THRESHOLD = 3  # Max encoder change to consider "stationary"
+STATIONARY_DURATION = 1.0  # Seconds of stationary data to trim from end
 # Global state & configuration
 CURRENT_OCCUPANCY = 0.0
 MANUAL_CLUSTER_RENAME = False
@@ -800,14 +802,21 @@ async def periodic_discovery():
 
 async def coast_motors():
     try:
-
         motor_controller.reinitialize()
         motor_controller.clear_reset_flag()
+        
+        for ch in (1, 2):
+            motor_controller.set_max_acceleration(ch, ACC)
+            motor_controller.set_max_deceleration(ch, DEC)
+        
         motor_controller.set_braking(1, 0)
         motor_controller.set_braking(2, 0)
         motor_controller.coast_now()
-        motor_controller.set_command_timeout_milliseconds(100)
-        logger.info("Encoders set to Coast mode")
+        
+        # Increase timeout to prevent premature coasting during playback
+        motor_controller.set_command_timeout_milliseconds(1000)  # Increased from 100ms to 1000ms
+        
+        logger.info(f"Motors initialized: ACC={ACC}, DEC={DEC}, timeout=1000ms, coast mode enabled")
     except Exception as e:
         logger.error(f"Motoron not set to Coast (possibly not connected or library missing): {e}")
 
@@ -1381,6 +1390,76 @@ async def get_battery():
     """
     return {"battery_percentage": 87.3, "status": "mock-this would be replaced with a battery status reading"}
 
+def trim_stationary_data(csv_path: str):
+    """
+    Trim stationary data from the end of a recorded path.
+    Removes rows where encoders haven't changed significantly for STATIONARY_DURATION seconds.
+    """
+    rows = []
+    with open(csv_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+    
+    if len(rows) < 10:
+        logger.info(f"Too few rows ({len(rows)}) to trim from {csv_path}")
+        return
+    
+    threshold_samples = int(STATIONARY_DURATION * SAMPLE_HZ)
+    buffer_samples = int(0.2 * SAMPLE_HZ)  # 0.2 seconds buffer
+
+    first_moving_idx = 0
+    start_left = int(rows[0]["left_pos"])
+    start_right = int(rows[0]["right_pos"])
+    
+    for i in range(1, min(len(rows), len(rows))):  # Check all rows
+        curr_left = int(rows[i]["left_pos"])
+        curr_right = int(rows[i]["right_pos"])
+        
+        if abs(curr_left - start_left) > STATIONARY_THRESHOLD or abs(curr_right - start_right) > STATIONARY_THRESHOLD:
+            first_moving_idx = max(0, i - buffer_samples)  # Keep small buffer before movement
+            logger.info(f"First significant movement at sample {i}: ({start_left},{start_right}) → ({curr_left},{curr_right})")
+            break
+
+    last_moving_idx = len(rows) - 1
+    end_left = int(rows[-1]["left_pos"])
+    end_right = int(rows[-1]["right_pos"])
+    
+    for i in range(len(rows) - 1, max(0, 0), -1):
+        if i == 0:
+            break
+        curr_left = int(rows[i]["left_pos"])
+        curr_right = int(rows[i]["right_pos"])
+        
+        # Check if position has deviated from the end position
+        if abs(curr_left - end_left) > STATIONARY_THRESHOLD or abs(curr_right - end_right) > STATIONARY_THRESHOLD:
+            last_moving_idx = min(len(rows) - 1, i + buffer_samples)  # Keep small buffer after movement
+            logger.info(f"Last significant movement at sample {i}: ({curr_left},{curr_right}) → ({end_left},{end_right})")
+            break
+    
+    if first_moving_idx >= last_moving_idx:
+        logger.warning(f"No significant movement detected in {csv_path}, keeping all data")
+        return
+    
+    trimmed_rows = rows[first_moving_idx:last_moving_idx + 1]
+    if first_moving_idx > 0 or last_moving_idx < len(rows) - 1:
+        trimmed_count_start = first_moving_idx
+        trimmed_count_end = len(rows) - last_moving_idx - 1
+        logger.info(f"Trimming {trimmed_count_start} samples from start, {trimmed_count_end} from end of {csv_path}")
+        logger.info(f"Kept {len(trimmed_rows)}/{len(rows)} samples")
+        
+        t_offset = int(trimmed_rows[0]["t_ms"])
+        for row in trimmed_rows:
+            row["t_ms"] = str(int(row["t_ms"]) - t_offset)
+        
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["t_ms", "left_pos", "right_pos"])
+            writer.writeheader()
+            for row in trimmed_rows:
+                writer.writerow(row)
+    else:
+        logger.info(f"No stationary data to trim from {csv_path}")
+
 async def record_motor_path(name: str):
     """
     Record motor path for the specified motor.
@@ -1406,16 +1485,17 @@ async def record_motor_path(name: str):
     events_writer = csv.writer(events)
     events_writer.writerow(["t_us","enc","A","B","delta","pos"])
     positions_writer = csv.writer(positions)
-    positions_writer.writerow(["t_us","left_pos","right_pos"])
+    positions_writer.writerow(["t_ms","left_pos","right_pos"])  # Changed to t_ms to match path_replay.py
 
     logger.info(f"Recording motor path for {name}")
     encL.bind_event_writer(events_writer, events)
     encR.bind_event_writer(events_writer, events)
     period = 1.0 / SAMPLE_HZ
+    t0 = time.time()  # Start time for relative timestamps
     try:
         while True:
-            t_us = time.monotonic_ns() // 1_000
-            positions_writer.writerow([t_us, encL.pos, encR.pos])
+            t_ms = int((time.time() - t0) * 1000)  # Milliseconds since start
+            positions_writer.writerow([t_ms, encL.pos, encR.pos])
             positions.flush()
             await asyncio.sleep(period)
     except asyncio.CancelledError:
@@ -1427,13 +1507,21 @@ async def record_motor_path(name: str):
         positions.close()
         encL.bind_event_writer(None, None)
         encR.bind_event_writer(None, None)
+        
+        samples_file = f"motor_paths/samples_{name}.csv"
+        try:
+            logger.info(f"Starting trim of {samples_file}...")
+            await asyncio.get_event_loop().run_in_executor(None, trim_stationary_data, samples_file)
+            logger.info(f"Trim completed for {samples_file}")
+        except Exception as e:
+            logger.error(f"Failed to trim stationary data: {e}")
+        
         logger.info(f"Motor path recording for {name} saved and closed")
         background_tasks.discard(asyncio.current_task())
 
 async def play_motor_path(name: str, reverse: bool = False):
     """
     Play back recorded motor path for the specified motor.
-    This is a placeholder implementation.
     """
     def clamp(value, min_value, max_value):
         return max(min_value, min(value, max_value))
@@ -1456,7 +1544,7 @@ async def play_motor_path(name: str, reverse: bool = False):
     with open(samples_file, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            t = int(row["t_us"])
+            t = int(row["t_ms"])  # Changed from t_us to t_ms
             L = int(row["left_pos"])
             R = int(row["right_pos"])
             sample_rows.append((t, L, R))
@@ -1467,37 +1555,87 @@ async def play_motor_path(name: str, reverse: bool = False):
     vL_prev, vR_prev = 0, 0
     if reverse:
         sample_rows = list(reversed(sample_rows))
+    
+    logger.info(f"Starting playback: {len(sample_rows)} samples, reverse={reverse}")
+    logger.info(f"Playback config: SPEED_SCALE={SPEED_SCALE}, MAX_PWM={MAX_PWM}, SMOOTH_ALPHA={SMOOTH_ALPHA}")
+    
     try:
+        # Ensure motor controller is properly configured before playback
+        motor_controller.reinitialize()
+        motor_controller.clear_reset_flag()
+        motor_controller.clear_motor_fault()
+        for ch in (1, 2):
+            motor_controller.set_max_acceleration(ch, ACC)
+            motor_controller.set_max_deceleration(ch, DEC)
+            motor_controller.set_braking(ch, 0)
+        motor_controller.set_command_timeout_milliseconds(1000)
+        
+        # Verify motor controller is responding
+        try:
+            status = motor_controller.get_status_flags()
+            logger.info(f"Motor controller status: 0x{status:04X}")
+            if status & 0x0004:  # Protocol error bit
+                logger.warning("Motor controller protocol error detected")
+            if status & 0x0080:  # Command timeout bit
+                logger.warning("Motor controller had command timeout")
+        except Exception as e:
+            logger.warning(f"Could not read motor controller status: {e}")
+        
+        logger.info("Motor controller reinitialized for playback")
+        
         motor_controller.set_speed(1,0)
         motor_controller.set_speed(2,0)
         await asyncio.sleep(0.2)
 
+        # Track statistics for debugging
+        max_vL, max_vR = 0, 0
+        total_distance_L, total_distance_R = 0, 0
+        
         for i in range(1, len(sample_rows)):
             t0,L0,R0 = sample_rows[i-1]
             t1,L1,R1 = sample_rows[i]
-            dt =max((t1 - t0)/1_000, MIN_DT)
+            dt = max((t1 - t0) / 1000.0, MIN_DT)
+            
             dL = (L1 - L0)
             dR = (R1 - R0)
             if reverse:
                 dL = -dL
                 dR = -dR
+            
             dL *= MOTOR_DIR_L
             dR *= MOTOR_DIR_R
-            vL = clamp(int(dL* SPEED_SCALE), -MAX_PWM, MAX_PWM)
-            vR = clamp(int(dR* SPEED_SCALE), -MAX_PWM, MAX_PWM)
+            
+            vL_cmd = clamp(int(dL * SPEED_SCALE), -MAX_PWM, MAX_PWM)
+            vR_cmd = clamp(int(dR * SPEED_SCALE), -MAX_PWM, MAX_PWM)
+            
             if SMOOTH_ALPHA > 0.0:
                 vL_cmd = int((1.0 - SMOOTH_ALPHA) * vL_prev + SMOOTH_ALPHA * vL_cmd)
                 vR_cmd = int((1.0 - SMOOTH_ALPHA) * vR_prev + SMOOTH_ALPHA * vR_cmd)
+            
+            # Track statistics
+            max_vL = max(max_vL, abs(vL_cmd))
+            max_vR = max(max_vR, abs(vR_cmd))
+            total_distance_L += abs(dL)
+            total_distance_R += abs(dR)
+            
+            if i % 20 == 0:
+                actual_L = encL.pos if not MOCK else 0
+                actual_R = encR.pos if not MOCK else 0
+                logger.debug(f"Step {i}/{len(sample_rows)}: dL={dL:+4d} dR={dR:+4d} → vL={vL_cmd:+4d} vR={vR_cmd:+4d} | Actual: L={actual_L} R={actual_R}")
+            
             motor_controller.set_speed(1, vL_cmd)
             motor_controller.set_speed(2, vR_cmd)
+            
             vL_prev = vL_cmd
             vR_prev = vR_cmd
             await asyncio.sleep(dt)
+        
         motor_controller.set_speed(1,0)
         motor_controller.set_speed(2,0)
         await asyncio.sleep(0.2)
         motor_controller.coast_now()
         logger.info("Motors set to coast after playback")
+        logger.info(f"Playback stats: max_vL={max_vL}, max_vR={max_vR}, total_dist_L={total_distance_L}, total_dist_R={total_distance_R}")
         logger.info(f"Path replay for {name} completed")
 
 
@@ -1549,6 +1687,77 @@ async def stop_recording_path():
     return {
         "message": "No active motor path recording found",
     }
+
+@app.post("/api/v1/motor/test")
+async def test_motors(speed: int = 200, duration: float = 2.0):
+    """
+    Test motor controller by running motors at specified speed for a duration.
+    Useful for diagnosing motor controller issues.
+    
+    Args:
+        speed: PWM speed (-800 to +800, default 200)
+        duration: Duration in seconds (default 2.0)
+    
+    Returns:
+        - message: Test result
+        - encoder_start: Starting encoder positions
+        - encoder_end: Ending encoder positions
+        - encoder_delta: Change in encoder positions
+    """
+    if MOCK:
+        return {"message": "Mock mode - skipping motor test"}
+    
+    try:
+        motor_controller.reinitialize()
+        motor_controller.clear_reset_flag()
+        motor_controller.clear_motor_fault()
+        
+        for ch in (1, 2):
+            motor_controller.set_max_acceleration(ch, ACC)
+            motor_controller.set_max_deceleration(ch, DEC)
+            motor_controller.set_braking(ch, 0)
+        
+        motor_controller.set_command_timeout_milliseconds(1000)
+        
+        status = motor_controller.get_status_flags()
+        logger.info(f"Motor controller status before test: 0x{status:04X}")
+        
+        start_L = encL.pos
+        start_R = encR.pos
+        
+        logger.info(f"Testing motors: speed={speed}, duration={duration}s")
+        motor_controller.set_speed(1, speed)
+        motor_controller.set_speed(2, speed)
+        
+        await asyncio.sleep(duration)
+        
+        motor_controller.set_speed(1, 0)
+        motor_controller.set_speed(2, 0)
+        await asyncio.sleep(0.2)
+        motor_controller.coast_now()
+        
+        end_L = encL.pos
+        end_R = encR.pos
+        
+        delta_L = end_L - start_L
+        delta_R = end_R - start_R
+        
+        logger.info(f"Motor test complete: L {start_L}→{end_L} (Δ{delta_L}), R {start_R}→{end_R} (Δ{delta_R})")
+        
+        return {
+            "message": "Motor test complete",
+            "speed": speed,
+            "duration": duration,
+            "encoder_start": {"left": start_L, "right": start_R},
+            "encoder_end": {"left": end_L, "right": end_R},
+            "encoder_delta": {"left": delta_L, "right": delta_R},
+            "status": f"0x{status:04X}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Motor test failed: {e}")
+        return {"message": f"Motor test failed: {e}"}
+
 @app.post("/api/v1/motor/dock")
 async def move_to_dock(dock_id: Optional[str] = "default_path"):
     """
@@ -1874,7 +2083,6 @@ async def preview_telemetry():
         }
     }
     
-    # Add slave telemetry if we're master
     if node_state["is_master"] and node_state["slaves"]:
         for slave_id in node_state["slaves"]:
             slave_telemetry = {
