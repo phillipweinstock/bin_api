@@ -17,7 +17,7 @@ CSV_PATH = "encoder_samples.csv"
 # set the corresponding side(s) to -1.
 # Try -1, -1 first; if that’s wrong, flip only one side.
 MOTOR_DIR_L = -1
-MOTOR_DIR_R = -1
+MOTOR_DIR_R = 1
 # =======================================
 
 def clamp(x, lo, hi):

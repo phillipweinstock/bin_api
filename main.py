@@ -41,8 +41,8 @@ MOCK = 0
 TRIG = 22
 ECHO = 16
 LID_SENSOR = 26  # GPIO pin for lid sensor (active low)
-MAX_DISTANCE = 20.0
-MIN_DISTANCE = 9.0
+MAX_DISTANCE = 24.72
+MIN_DISTANCE = 15
 TIMEOUT = 0.02  # 20 ms timeout
 SAMPLE_COUNT = 5
 # Encoder constants & objects
@@ -57,13 +57,14 @@ SPEED_SCALE = 13   #( 100-300)
 SMOOTH_ALPHA = 0.5
 MIN_DT = 0.005
 MOTOR_DIR_L = -1
-MOTOR_DIR_R = -1
+MOTOR_DIR_R = 1
 STATIONARY_THRESHOLD = 3  # Max encoder change to consider "stationary"
 STATIONARY_DURATION = 1.0  # Seconds of stationary data to trim from end
 # Global state & configuration
 CURRENT_OCCUPANCY = 0.0
 MANUAL_CLUSTER_RENAME = False
 LID_LOCKED = False
+MOTOR_OPERATION_ACTIVE = False  # Lock lid during motor path operations
 WEBHOOK = "http://172.26.59.116:3000/api/bin-status"
 
 
@@ -440,7 +441,7 @@ async def lid_control_task():
     background_tasks.add(asyncio.current_task())
     
     try:
-        servo = kit.servo[10]
+        servo = kit.servo[0]
         servo.actuation_range = 180
         lid_sensor_gpio = None
         if MOCK == 0:
@@ -460,10 +461,14 @@ async def lid_control_task():
         
         while True:
             try:
-                if LID_LOCKED:
+                # Check if motor operation is active or lid is manually locked
+                if LID_LOCKED or MOTOR_OPERATION_ACTIVE:
                     with dht_lock:
-                        servo.angle = 0
-                    logging.info("Lid is locked. Keeping closed.")
+                        servo.angle = 180
+                    if MOTOR_OPERATION_ACTIVE:
+                        logging.debug("Motor operation active - lid locked closed.")
+                    else:
+                        logging.info("Lid is manually locked. Keeping closed.")
                     await asyncio.sleep(0.5)
                     continue
                 
@@ -477,18 +482,18 @@ async def lid_control_task():
                     if sensor_value == 0:  # Sensor triggered (active low)
                         logging.info("Lid sensor triggered! Opening lid...")
                         with dht_lock:
-                            servo.angle = 180
+                            servo.angle = 0#180
                         await asyncio.sleep(5)
                         logging.info("Closing lid...")
                         with dht_lock:
-                            servo.angle = 0
+                            servo.angle = 180
                         await asyncio.sleep(1)  
                     else:
                         with dht_lock:
-                            servo.angle = 0
+                            servo.angle = 180
                 else:
                     with dht_lock:
-                        servo.angle = 0
+                        servo.angle = 180
                 
                 await asyncio.sleep(0.1)
                 
@@ -695,8 +700,23 @@ async def periodic_telemetry():
     while True:
         try:
             # Collect this node's telemetry
-            current_temp = dhtDevice.temperature if MOCK == 0 else 25.0
-            current_humidity = dhtDevice.humidity if MOCK == 0 else 50.0
+            if MOCK == 0:
+                try:
+                    with open("/sys/bus/iio/devices/iio:device0/in_temp_input", "r") as f:
+                        current_temp = int(f.read().strip()) / 1000.0
+                    with open("/sys/bus/iio/devices/iio:device0/in_humidityrelative_input", "r") as f:
+                        current_humidity = int(f.read().strip()) / 1000.0
+                except FileNotFoundError as e:
+                    logger.warning(f"IIO sensor files not found, using mock values: {e}")
+                    current_temp = 25.0
+                    current_humidity = 50.0
+                except Exception as e:
+                    logger.error(f"Error reading IIO sensors, using mock values: {e}")
+                    current_temp = 25.0
+                    current_humidity = 50.0
+            else:
+                current_temp = 25.0
+                current_humidity = 50.0
             
             this_node_telemetry = {
                 "bin_id": node_state["bin_id"],
@@ -838,7 +858,7 @@ async def startup_event():
         controller = GPIO.gpiochip_open(0)
         
         
-        # Free GPIO pins if they're already claimed (cleanup from previous run)
+        
         try:
             GPIO.gpio_free(controller, TRIG)
             logger.debug(f"Freed GPIO pin {TRIG}")
@@ -933,7 +953,7 @@ async def startup_event():
 
     # Start periodic tasks in background
     asyncio.create_task(periodic_discovery())
-    #asyncio.create_task(periodic_telemetry())
+    asyncio.create_task(periodic_telemetry())
     asyncio.create_task(lid_control_task())
     asyncio.create_task(occupancy_monitoring_task())
     # TODO implement a task to raise an event when the bin is full or about to be full
@@ -1463,193 +1483,220 @@ def trim_stationary_data(csv_path: str):
 async def record_motor_path(name: str):
     """
     Record motor path for the specified motor.
-    This is a placeholder implementation.
     """
+    global MOTOR_OPERATION_ACTIVE
     background_tasks.add(asyncio.current_task())
+    
     if MOCK:
         logger.info("Mock mode - skipping motor path recording")
         background_tasks.remove(asyncio.current_task())
         return
     
-    os.makedirs("motor_paths", exist_ok=True)
+    # Lock the lid during motor operation
+    MOTOR_OPERATION_ACTIVE = True
+    logger.info("Motor operation started - lid locked")
     
-    if os.path.exists(f"motor_paths/events_{name}.csv"):
-        logger.warning(f"Motor path events {name} already exists and will be overwritten.")
-        os.remove(f"motor_paths/events_{name}.csv")
-    if os.path.exists(f"motor_paths/samples_{name}.csv"):
-        logger.warning(f"Motor path samples {name} already exists and will be overwritten.")
-        os.remove(f"motor_paths/samples_{name}.csv")
-        
-    events = open(f"motor_paths/events_{name}.csv", "w", newline="")
-    positions = open(f"motor_paths/samples_{name}.csv", "w", newline="")
-    events_writer = csv.writer(events)
-    events_writer.writerow(["t_us","enc","A","B","delta","pos"])
-    positions_writer = csv.writer(positions)
-    positions_writer.writerow(["t_ms","left_pos","right_pos"])  # Changed to t_ms to match path_replay.py
-
-    logger.info(f"Recording motor path for {name}")
-    encL.bind_event_writer(events_writer, events)
-    encR.bind_event_writer(events_writer, events)
-    period = 1.0 / SAMPLE_HZ
-    t0 = time.time()  # Start time for relative timestamps
     try:
-        while True:
-            t_ms = int((time.time() - t0) * 1000)  # Milliseconds since start
-            positions_writer.writerow([t_ms, encL.pos, encR.pos])
-            positions.flush()
-            await asyncio.sleep(period)
-    except asyncio.CancelledError:
-        logger.info(f"Recording task for {name} stopped, saving path...")
-    finally:
-        events.flush()
-        positions.flush()
-        events.close()
-        positions.close()
-        encL.bind_event_writer(None, None)
-        encR.bind_event_writer(None, None)
+        os.makedirs("motor_paths", exist_ok=True)
         
-        samples_file = f"motor_paths/samples_{name}.csv"
+        if os.path.exists(f"motor_paths/events_{name}.csv"):
+            logger.warning(f"Motor path events {name} already exists and will be overwritten.")
+            os.remove(f"motor_paths/events_{name}.csv")
+        if os.path.exists(f"motor_paths/samples_{name}.csv"):
+            logger.warning(f"Motor path samples {name} already exists and will be overwritten.")
+            os.remove(f"motor_paths/samples_{name}.csv")
+            
+        events = open(f"motor_paths/events_{name}.csv", "w", newline="")
+        positions = open(f"motor_paths/samples_{name}.csv", "w", newline="")
+        events_writer = csv.writer(events)
+        events_writer.writerow(["t_us","enc","A","B","delta","pos"])
+        positions_writer = csv.writer(positions)
+        positions_writer.writerow(["t_ms","left_pos","right_pos"])  # Changed to t_ms to match path_replay.py
+
+        logger.info(f"Recording motor path for {name}")
+        encL.bind_event_writer(events_writer, events)
+        encR.bind_event_writer(events_writer, events)
+        period = 1.0 / SAMPLE_HZ
+        t0 = time.time()  # Start time for relative timestamps
         try:
-            logger.info(f"Starting trim of {samples_file}...")
-            await asyncio.get_event_loop().run_in_executor(None, trim_stationary_data, samples_file)
-            logger.info(f"Trim completed for {samples_file}")
-        except Exception as e:
-            logger.error(f"Failed to trim stationary data: {e}")
-        
-        logger.info(f"Motor path recording for {name} saved and closed")
+            while True:
+                t_ms = int((time.time() - t0) * 1000)  # Milliseconds since start
+                positions_writer.writerow([t_ms, encL.pos, encR.pos])
+                positions.flush()
+                await asyncio.sleep(period)
+        except asyncio.CancelledError:
+            logger.info(f"Recording task for {name} stopped, saving path...")
+        finally:
+            events.flush()
+            positions.flush()
+            events.close()
+            positions.close()
+            encL.bind_event_writer(None, None)
+            encR.bind_event_writer(None, None)
+            
+            samples_file = f"motor_paths/samples_{name}.csv"
+            try:
+                logger.info(f"Starting trim of {samples_file}...")
+                await asyncio.get_event_loop().run_in_executor(None, trim_stationary_data, samples_file)
+                logger.info(f"Trim completed for {samples_file}")
+            except Exception as e:
+                logger.error(f"Failed to trim stationary data: {e}")
+            
+            logger.info(f"Motor path recording for {name} saved and closed")
+    finally:
+        # Unlock the lid when motor operation is done
+        MOTOR_OPERATION_ACTIVE = False
+        logger.info("Motor operation finished - lid unlocked")
         background_tasks.discard(asyncio.current_task())
 
 async def play_motor_path(name: str, reverse: bool = False):
     """
     Play back recorded motor path for the specified motor.
     """
+    global MOTOR_OPERATION_ACTIVE
+    
     def clamp(value, min_value, max_value):
         return max(min_value, min(value, max_value))
     
     background_tasks.add(asyncio.current_task())
+    
     if MOCK:
         logger.info("Mock mode - skipping motor path playback")
         background_tasks.remove(asyncio.current_task())
         return
     
-    events_file = f"motor_paths/events_{name}.csv"
-    samples_file = f"motor_paths/samples_{name}.csv"
-    if not os.path.exists(events_file) or not os.path.exists(samples_file):
-        logger.error(f"Motor path files for {name} not found.")
-        background_tasks.remove(asyncio.current_task())
-        return
-
-    logger.info(f"Playing back motor path for {name} (Going to dock={reverse})")
-    sample_rows = []
-    with open(samples_file, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            t = int(row["t_ms"])  # Changed from t_us to t_ms
-            L = int(row["left_pos"])
-            R = int(row["right_pos"])
-            sample_rows.append((t, L, R))
-        if len(sample_rows) < 2:
-            logger.error(f"No samples found in {samples_file}")
-            background_tasks.remove(asyncio.current_task())
-            return
-    vL_prev, vR_prev = 0, 0
-    if reverse:
-        sample_rows = list(reversed(sample_rows))
-    
-    logger.info(f"Starting playback: {len(sample_rows)} samples, reverse={reverse}")
-    logger.info(f"Playback config: SPEED_SCALE={SPEED_SCALE}, MAX_PWM={MAX_PWM}, SMOOTH_ALPHA={SMOOTH_ALPHA}")
+    async def turn_180(motor_controller):
+        logger.info("Executing 180-degree turn maneuver")
+        motor_controller.set_speed(1, 380 * -1)
+        motor_controller.set_speed(2, 380 * MOTOR_DIR_R)
+        await asyncio.sleep(10)
+        motor_controller.set_speed(1, 0)
+        motor_controller.set_speed(2, 0)
+        motor_controller.coast_now()
+        logger.info("180-degree turn maneuver complete")
+    # Lock the lid during motor operation
+    MOTOR_OPERATION_ACTIVE = True
+    logger.info("Motor operation started - lid locked")
     
     try:
-        # Ensure motor controller is properly configured before playback
-        motor_controller.reinitialize()
-        motor_controller.clear_reset_flag()
-        motor_controller.clear_motor_fault()
-        for ch in (1, 2):
-            motor_controller.set_max_acceleration(ch, ACC)
-            motor_controller.set_max_deceleration(ch, DEC)
-            motor_controller.set_braking(ch, 0)
-        motor_controller.set_command_timeout_milliseconds(1000)
+        events_file = f"motor_paths/events_{name}.csv"
+        samples_file = f"motor_paths/samples_{name}.csv"
+        if not os.path.exists(events_file) or not os.path.exists(samples_file):
+            logger.error(f"Motor path files for {name} not found.")
+            return
+
+        logger.info(f"Playing back motor path for {name} (Going to dock={reverse})")
+        sample_rows = []
+        with open(samples_file, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                t = int(row["t_ms"])  # Changed from t_us to t_ms
+                L = int(row["left_pos"])
+                R = int(row["right_pos"])
+                sample_rows.append((t, L, R))
+            if len(sample_rows) < 2:
+                logger.error(f"No samples found in {samples_file}")
+                return
+        vL_prev, vR_prev = 0, 0
+        if reverse:
+            sample_rows = list(reversed(sample_rows))
         
-        # Verify motor controller is responding
+        logger.info(f"Starting playback: {len(sample_rows)} samples, reverse={reverse}")
+        logger.info(f"Playback config: SPEED_SCALE={SPEED_SCALE}, MAX_PWM={MAX_PWM}, SMOOTH_ALPHA={SMOOTH_ALPHA}")
+        logger.info(f"Motor DIR config: MOTOR_DIR_L={MOTOR_DIR_L}, MOTOR_DIR_R={MOTOR_DIR_R}")
+        
         try:
-            status = motor_controller.get_status_flags()
-            logger.info(f"Motor controller status: 0x{status:04X}")
-            if status & 0x0004:  # Protocol error bit
-                logger.warning("Motor controller protocol error detected")
-            if status & 0x0080:  # Command timeout bit
-                logger.warning("Motor controller had command timeout")
-        except Exception as e:
-            logger.warning(f"Could not read motor controller status: {e}")
-        
-        logger.info("Motor controller reinitialized for playback")
-        
-        motor_controller.set_speed(1,0)
-        motor_controller.set_speed(2,0)
-        await asyncio.sleep(0.2)
+            # Ensure motor controller is properly configured before playback
+            motor_controller.reinitialize()
+            motor_controller.clear_reset_flag() 
+            motor_controller.clear_motor_fault()
+            for ch in (1, 2):
+                motor_controller.set_max_acceleration(ch, ACC)
+                motor_controller.set_max_deceleration(ch, DEC)
+                motor_controller.set_braking(ch, 0)
+            motor_controller.set_command_timeout_milliseconds(1000)
+            
+            # Verify motor controller is responding
+            try:
+                status = motor_controller.get_status_flags()
+                logger.info(f"Motor controller status: 0x{status:04X}")
+                if status & 0x0004:  # Protocol error bit
+                    logger.warning("Motor controller protocol error detected")
+                if status & 0x0080:  # Command timeout bit
+                    logger.warning("Motor controller had command timeout")
+            except Exception as e:
+                logger.warning(f"Could not read motor controller status: {e}")
+            
+            logger.info("Motor controller reinitialized for playback")
+            
+            motor_controller.set_speed(1,0)
+            motor_controller.set_speed(2,0)
+            await asyncio.sleep(0.2)
 
-        # Track statistics for debugging
-        max_vL, max_vR = 0, 0
-        total_distance_L, total_distance_R = 0, 0
-        
-        for i in range(1, len(sample_rows)):
-            t0,L0,R0 = sample_rows[i-1]
-            t1,L1,R1 = sample_rows[i]
-            dt = max((t1 - t0) / 1000.0, MIN_DT)
+            # Track statistics for debugging
+            max_vL, max_vR = 0, 0
+            total_distance_L, total_distance_R = 0, 0
+            await turn_180(motor_controller)
+            for i in range(1, len(sample_rows)):
+                t0,L0,R0 = sample_rows[i-1]
+                t1,L1,R1 = sample_rows[i]
+                dt = max((t1 - t0) / 1000.0, MIN_DT)
+                
+                dL = (L1 - L0)
+                dR = (R1 - R0)
+                # if reverse:
+                #     dL = -dL
+                #     dR = -dR
+                
+                dL *= MOTOR_DIR_L
+                dR *= MOTOR_DIR_R
+                
+                vL_cmd = clamp(int(dL * SPEED_SCALE), -MAX_PWM, MAX_PWM)
+                vR_cmd = clamp(int(dR * SPEED_SCALE), -MAX_PWM, MAX_PWM)
+                
+                if SMOOTH_ALPHA > 0.0:
+                    vL_cmd = int((1.0 - SMOOTH_ALPHA) * vL_prev + SMOOTH_ALPHA * vL_cmd)
+                    vR_cmd = int((1.0 - SMOOTH_ALPHA) * vR_prev + SMOOTH_ALPHA * vR_cmd)
+                
+                # Track statistics
+                max_vL = max(max_vL, abs(vL_cmd))
+                max_vR = max(max_vR, abs(vR_cmd))
+                total_distance_L += abs(dL)
+                total_distance_R += abs(dR)
+                
+                if i % 20 == 0:
+                    actual_L = encL.pos if not MOCK else 0
+                    actual_R = encR.pos if not MOCK else 0
+                    logger.debug(f"Step {i}/{len(sample_rows)}: dL={dL:+4d} dR={dR:+4d} → vL={vL_cmd:+4d} vR={vR_cmd:+4d} | Actual: L={actual_L} R={actual_R}")
+                
+                motor_controller.set_speed(1, vL_cmd)
+                motor_controller.set_speed(2, vR_cmd)
+                
+                vL_prev = vL_cmd
+                vR_prev = vR_cmd
+                await asyncio.sleep(dt)
             
-            dL = (L1 - L0)
-            dR = (R1 - R0)
-            if reverse:
-                dL = -dL
-                dR = -dR
-            
-            dL *= MOTOR_DIR_L
-            dR *= MOTOR_DIR_R
-            
-            vL_cmd = clamp(int(dL * SPEED_SCALE), -MAX_PWM, MAX_PWM)
-            vR_cmd = clamp(int(dR * SPEED_SCALE), -MAX_PWM, MAX_PWM)
-            
-            if SMOOTH_ALPHA > 0.0:
-                vL_cmd = int((1.0 - SMOOTH_ALPHA) * vL_prev + SMOOTH_ALPHA * vL_cmd)
-                vR_cmd = int((1.0 - SMOOTH_ALPHA) * vR_prev + SMOOTH_ALPHA * vR_cmd)
-            
-            # Track statistics
-            max_vL = max(max_vL, abs(vL_cmd))
-            max_vR = max(max_vR, abs(vR_cmd))
-            total_distance_L += abs(dL)
-            total_distance_R += abs(dR)
-            
-            if i % 20 == 0:
-                actual_L = encL.pos if not MOCK else 0
-                actual_R = encR.pos if not MOCK else 0
-                logger.debug(f"Step {i}/{len(sample_rows)}: dL={dL:+4d} dR={dR:+4d} → vL={vL_cmd:+4d} vR={vR_cmd:+4d} | Actual: L={actual_L} R={actual_R}")
-            
-            motor_controller.set_speed(1, vL_cmd)
-            motor_controller.set_speed(2, vR_cmd)
-            
-            vL_prev = vL_cmd
-            vR_prev = vR_cmd
-            await asyncio.sleep(dt)
-        
-        motor_controller.set_speed(1,0)
-        motor_controller.set_speed(2,0)
-        await asyncio.sleep(0.2)
-        motor_controller.coast_now()
-        logger.info("Motors set to coast after playback")
-        logger.info(f"Playback stats: max_vL={max_vL}, max_vR={max_vR}, total_dist_L={total_distance_L}, total_dist_R={total_distance_R}")
-        logger.info(f"Path replay for {name} completed")
+            motor_controller.set_speed(1,0)
+            motor_controller.set_speed(2,0)
+            await asyncio.sleep(0.2)
+            motor_controller.coast_now()
+            logger.info("Motors set to coast after playback")
+            logger.info(f"Playback stats: max_vL={max_vL}, max_vR={max_vR}, total_dist_L={total_distance_L}, total_dist_R={total_distance_R}")
+            logger.info(f"Path replay for {name} completed")
 
-
-    except asyncio.CancelledError:
-        logger.info(f"Motor path playback for {name} cancelled, stopping motors...")
-        motor_controller.set_speed(1,0)
-        motor_controller.set_speed(2,0)
-        motor_controller.coast_now()
-        background_tasks.remove(asyncio.current_task())
-        return
+        except asyncio.CancelledError:
+            logger.info(f"Motor path playback for {name} cancelled, stopping motors...")
+            motor_controller.set_speed(1,0)
+            motor_controller.set_speed(2,0)
+            motor_controller.coast_now()
+            raise
+            
     finally:
+        # Unlock the lid when motor operation is done
+        MOTOR_OPERATION_ACTIVE = False
+        logger.info("Motor operation finished - lid unlocked")
         await asyncio.sleep(0.2)
         background_tasks.remove(asyncio.current_task())
-        return
 
 
 
@@ -1875,7 +1922,20 @@ async def get_temperature():
         }
         ```
     """
-    return {"temperature_celsius": 22.5}
+    try:
+        if MOCK == 0:
+            with open("/sys/bus/iio/devices/iio:device0/in_temp_input", "r") as f:
+                temp_raw = int(f.read().strip())
+                temp_celsius = temp_raw / 1000.0
+        else:
+            temp_celsius = 22.5
+        return {"temperature_celsius": temp_celsius}
+    except FileNotFoundError:
+        logger.error("Temperature sensor file not found")
+        raise HTTPException(status_code=503, detail="Temperature sensor not available")
+    except Exception as e:
+        logger.error(f"Error reading temperature: {e}")
+        raise HTTPException(status_code=500, detail=f"Temperature sensor error: {e}")
 
 
 @app.get("/api/v1/environment/humidity")
@@ -1898,7 +1958,20 @@ async def get_humidity():
         }
         ```
     """
-    return {"humidity_relative": 55.0}
+    try:
+        if MOCK == 0:
+            with open("/sys/bus/iio/devices/iio:device0/in_humidityrelative_input", "r") as f:
+                humidity_raw = int(f.read().strip())
+                humidity_relative = humidity_raw / 1000.0
+        else:
+            humidity_relative = 55.0
+        return {"humidity_relative": humidity_relative}
+    except FileNotFoundError:
+        logger.error("Humidity sensor file not found")
+        raise HTTPException(status_code=503, detail="Humidity sensor not available")
+    except Exception as e:
+        logger.error(f"Error reading humidity: {e}")
+        raise HTTPException(status_code=500, detail=f"Humidity sensor error: {e}")
 
 
 @app.get("/api/v1/environment")
@@ -1925,11 +1998,33 @@ async def get_environment():
         }
         ```
     """
-    return {
-        "temperature_celsius": 25.0,
-        "humidity_relative": 50.0,
-        "status": "mock"
-    }
+    try:
+        if MOCK == 0:
+            with open("/sys/bus/iio/devices/iio:device0/in_temp_input", "r") as f:
+                temp_raw = int(f.read().strip())
+                temp_celsius = temp_raw / 1000.0
+            
+            with open("/sys/bus/iio/devices/iio:device0/in_humidityrelative_input", "r") as f:
+                humidity_raw = int(f.read().strip())
+                humidity_relative = humidity_raw / 1000.0
+            
+            status = "ok"
+        else:
+            temp_celsius = 25.0
+            humidity_relative = 50.0
+            status = "mock"
+        
+        return {
+            "temperature_celsius": temp_celsius,
+            "humidity_relative": humidity_relative,
+            "status": status
+        }
+    except FileNotFoundError:
+        logger.error("Environmental sensor files not found")
+        raise HTTPException(status_code=503, detail="Environmental sensors not available")
+    except Exception as e:
+        logger.error(f"Error reading environmental sensors: {e}")
+        raise HTTPException(status_code=500, detail=f"Environmental sensor error: {e}")
 
 
 @app.get("/api/v1/signal-strength")
