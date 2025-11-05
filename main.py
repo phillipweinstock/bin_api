@@ -482,12 +482,17 @@ async def lid_control_task():
                     if sensor_value == 0:  # Sensor triggered (active low)
                         logging.info("Lid sensor triggered! Opening lid...")
                         with dht_lock:
-                            servo.angle = 0#180
+                            #servo.angle = 0#180
+                            for angle in range(180, -1, -1):
+                                servo.angle = angle
+                                await asyncio.sleep(0.02)
                         await asyncio.sleep(5)
                         logging.info("Closing lid...")
                         with dht_lock:
-                            servo.angle = 180
-                        await asyncio.sleep(1)  
+                            for angle in range(0, 181, 1):
+                                servo.angle = angle
+                                await asyncio.sleep(0.02)
+                        await asyncio.sleep(1)
                     else:
                         with dht_lock:
                             servo.angle = 180
@@ -508,20 +513,73 @@ async def lid_control_task():
 
 
 async def open_door():
-    # Open the door using servo on channel 11
+    # Open the door using servo on channel 2
     logging.info("Door open task started")
     background_tasks.add(asyncio.current_task())
-    servo = kit.servo[11]
-    servo.actuation_range = 180
-    with dht_lock:
-        for angle in range(0, 181, 10):
-            servo.angle = angle
-            await asyncio.sleep(0.05)
-        for angle in range(180, -1, -10):
-            servo.angle = angle
-            await asyncio.sleep(0.05)
-    background_tasks.remove(asyncio.current_task())
-
+    
+    def blocking_servo_sweep():
+        try:
+            servo = kit.servo[2]
+            servo.actuation_range = 180
+            logging.info(f"Door servo initialized on channel 2, actuation_range=180")
+            
+            logging.info("Starting door opening sequence: 180° → 100°")
+            for angle in range(180, 100, -10):
+                servo.angle = angle
+                logging.debug(f"Door servo angle set to {angle}°")
+                time.sleep(0.5)
+            
+            logging.info("Door opening sequence completed")
+        except Exception as e:
+            logging.error(f"Error during door opening: {e}", exc_info=True)
+    
+    try:
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(None, blocking_servo_sweep),
+            timeout=10.0
+        )
+    except asyncio.TimeoutError:
+        logging.error("Door opening timed out after 10 seconds")
+    except Exception as e:
+        logging.error(f"Error in door open task: {e}", exc_info=True)
+    finally:
+        background_tasks.remove(asyncio.current_task())
+        logging.info("Door open task finished")
+    
+async def close_door():
+    # Close the door using servo on channel 2
+    logging.info("Door close task started")
+    background_tasks.add(asyncio.current_task())
+    
+    def blocking_servo_sweep():
+        try:
+            servo = kit.servo[2]
+            servo.actuation_range = 180
+            logging.info("Starting door closing sequence: 100° → 180°")
+            
+            for angle in range(100, 181, 10):  # Changed to 181 to include 180°
+                servo.angle = angle
+                logging.debug(f"Door servo angle set to {angle}°")
+                time.sleep(0.5)  # Increased from 0.1 to 0.5 to match open_door
+            
+            logging.info("Door closing sequence completed")
+        except Exception as e:
+            logging.error(f"Error during door closing: {e}", exc_info=True)
+    
+    try:
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(None, blocking_servo_sweep),
+            timeout=10.0  # Increased from 5.0 to 10.0 to match open_door
+        )
+    except asyncio.TimeoutError:
+        logging.error("Door closing timed out after 10 seconds")
+    except Exception as e:
+        logging.error(f"Error in door close task: {e}", exc_info=True)
+    finally:
+        background_tasks.remove(asyncio.current_task())
+        logging.info("Door close task finished")
 
 def get_hardware_id():
     """
@@ -797,7 +855,7 @@ async def periodic_telemetry():
         except Exception as e:
             logger.error(f"Error in telemetry task: {e}")
         
-        await asyncio.sleep(300)  # Every 5 minutes
+        await asyncio.sleep(5)  # Every 5 minutes
     
     background_tasks.remove(asyncio.current_task())
 
@@ -1549,9 +1607,48 @@ async def record_motor_path(name: str):
         logger.info("Motor operation finished - lid unlocked")
         background_tasks.discard(asyncio.current_task())
 
+async def turn_180(mc=None, turn_speed: int = 380, turn_duration: float = 1.0):
+    """
+    Execute a 180-degree turn in place.
+    
+    Args:
+        mc: Motor controller instance (uses global motor_controller if None)
+        turn_speed: PWM speed for turning (default 380)
+        turn_duration: Duration of turn in seconds (default 1.0, tune for your robot)
+    
+    The robot turns by running motors in opposite directions:
+    - Left motor: backward
+    - Right motor: forward
+    """
+    if mc is None:
+        mc = motor_controller
+    
+    logger.info(f"Executing 180° turn: speed={turn_speed}, duration={turn_duration}s")
+    
+    # Left motor backward, right motor forward for clockwise turn
+    mc.set_speed(1, -turn_speed * MOTOR_DIR_L)
+    mc.set_speed(2, turn_speed * MOTOR_DIR_R)
+    
+    await asyncio.sleep(turn_duration)
+    
+    mc.set_speed(1, 0)
+    mc.set_speed(2, 0)
+    mc.coast_now()
+    
+    logger.info("180° turn complete")
+
 async def play_motor_path(name: str, reverse: bool = False):
     """
     Play back recorded motor path for the specified motor.
+    
+    If reverse=False (returning from dock):
+        1. Turn 180° in place
+        2. Play path forward
+        3. Turn 180° again to face original direction
+    
+    If reverse=True (going to dock):
+        1. Play path forward normally
+        2. Turn 180° at dock to face outward
     """
     global MOTOR_OPERATION_ACTIVE
     
@@ -1565,15 +1662,6 @@ async def play_motor_path(name: str, reverse: bool = False):
         background_tasks.remove(asyncio.current_task())
         return
     
-    async def turn_180(motor_controller):
-        logger.info("Executing 180-degree turn maneuver")
-        motor_controller.set_speed(1, 380 * -1)
-        motor_controller.set_speed(2, 380 * MOTOR_DIR_R)
-        await asyncio.sleep(10)
-        motor_controller.set_speed(1, 0)
-        motor_controller.set_speed(2, 0)
-        motor_controller.coast_now()
-        logger.info("180-degree turn maneuver complete")
     # Lock the lid during motor operation
     MOTOR_OPERATION_ACTIVE = True
     logger.info("Motor operation started - lid locked")
@@ -1583,6 +1671,9 @@ async def play_motor_path(name: str, reverse: bool = False):
         samples_file = f"motor_paths/samples_{name}.csv"
         if not os.path.exists(events_file) or not os.path.exists(samples_file):
             logger.error(f"Motor path files for {name} not found.")
+            MOTOR_OPERATION_ACTIVE = False
+            logger.info("Motor operation aborted - lid unlocked")
+            background_tasks.discard(asyncio.current_task())
             return
 
         logger.info(f"Playing back motor path for {name} (Going to dock={reverse})")
@@ -1590,16 +1681,18 @@ async def play_motor_path(name: str, reverse: bool = False):
         with open(samples_file, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                t = int(row["t_ms"])  # Changed from t_us to t_ms
+                t = int(row["t_ms"])
                 L = int(row["left_pos"])
                 R = int(row["right_pos"])
                 sample_rows.append((t, L, R))
             if len(sample_rows) < 2:
                 logger.error(f"No samples found in {samples_file}")
+                MOTOR_OPERATION_ACTIVE = False
+                logger.info("Motor operation aborted - lid unlocked")
+                background_tasks.discard(asyncio.current_task())
                 return
+        
         vL_prev, vR_prev = 0, 0
-        if reverse:
-            sample_rows = list(reversed(sample_rows))
         
         logger.info(f"Starting playback: {len(sample_rows)} samples, reverse={reverse}")
         logger.info(f"Playback config: SPEED_SCALE={SPEED_SCALE}, MAX_PWM={MAX_PWM}, SMOOTH_ALPHA={SMOOTH_ALPHA}")
@@ -1629,27 +1722,33 @@ async def play_motor_path(name: str, reverse: bool = False):
             
             logger.info("Motor controller reinitialized for playback")
             
-            motor_controller.set_speed(1,0)
-            motor_controller.set_speed(2,0)
+            motor_controller.set_speed(1, 0)
+            motor_controller.set_speed(2, 0)
             await asyncio.sleep(0.2)
 
             # Track statistics for debugging
             max_vL, max_vR = 0, 0
             total_distance_L, total_distance_R = 0, 0
-            await turn_180(motor_controller)
+            
+            # RETURN MODE: Turn 180° before playing path
+            if not reverse:
+                #logger.info("RETURN MODE: Executing first 180° turn before playback")
+                await turn_180(motor_controller)
+                await asyncio.sleep(1)
+
+            #if reverse:
+            sample_rows = list(reversed(sample_rows))
+            
+            # Play path forward (no reversal of motor commands)
+            logger.info("Starting path playback (moving forward)")
             for i in range(1, len(sample_rows)):
-                t0,L0,R0 = sample_rows[i-1]
-                t1,L1,R1 = sample_rows[i]
+                t0, L0, R0 = sample_rows[i-1]
+                t1, L1, R1 = sample_rows[i]
                 dt = max((t1 - t0) / 1000.0, MIN_DT)
                 
-                dL = (L1 - L0)
-                dR = (R1 - R0)
-                # if reverse:
-                #     dL = -dL
-                #     dR = -dR
-                
-                dL *= MOTOR_DIR_L
-                dR *= MOTOR_DIR_R
+                # Apply motor direction corrections (no reversal)
+                dL = (L1 - L0) * MOTOR_DIR_L
+                dR = (R1 - R0) * MOTOR_DIR_R
                 
                 vL_cmd = clamp(int(dL * SPEED_SCALE), -MAX_PWM, MAX_PWM)
                 vR_cmd = clamp(int(dR * SPEED_SCALE), -MAX_PWM, MAX_PWM)
@@ -1676,9 +1775,19 @@ async def play_motor_path(name: str, reverse: bool = False):
                 vR_prev = vR_cmd
                 await asyncio.sleep(dt)
             
-            motor_controller.set_speed(1,0)
-            motor_controller.set_speed(2,0)
+            motor_controller.set_speed(1, 0)
+            motor_controller.set_speed(2, 0)
             await asyncio.sleep(0.2)
+            
+            # Turn 180° after playback (both modes)
+            #logger.info("Executing 180° turn after playback")
+            #await turn_180(motor_controller)
+            #await asyncio.sleep(1)
+            if not reverse:
+                #logger.info("RETURN MODE: Executing first 180° turn before playback")
+                await turn_180(motor_controller)
+                await asyncio.sleep(1)
+            
             motor_controller.coast_now()
             logger.info("Motors set to coast after playback")
             logger.info(f"Playback stats: max_vL={max_vL}, max_vR={max_vR}, total_dist_L={total_distance_L}, total_dist_R={total_distance_R}")
@@ -1686,8 +1795,8 @@ async def play_motor_path(name: str, reverse: bool = False):
 
         except asyncio.CancelledError:
             logger.info(f"Motor path playback for {name} cancelled, stopping motors...")
-            motor_controller.set_speed(1,0)
-            motor_controller.set_speed(2,0)
+            motor_controller.set_speed(1, 0)
+            motor_controller.set_speed(2, 0)
             motor_controller.coast_now()
             raise
             
@@ -1698,7 +1807,15 @@ async def play_motor_path(name: str, reverse: bool = False):
         await asyncio.sleep(0.2)
         background_tasks.remove(asyncio.current_task())
 
-
+@app.get("/api/v1/motor/busy")
+async def motor_busy():
+    """
+    Check if motor is currently in operation (recording or playback).
+    
+    Returns:
+        - busy: Boolean indicating if motor is busy
+    """
+    return {"busy": MOTOR_OPERATION_ACTIVE}
 
 @app.post("/api/v1/motor/record_path/start")
 async def start_recording_path(name: Optional[str] = "default_path"):
@@ -1721,19 +1838,35 @@ async def stop_recording_path():
     Returns:
         - message: Status message indicating recording has stopped
     """
-    for task in background_tasks:
+    global MOTOR_OPERATION_ACTIVE
+    
+    task_found = False
+    for task in list(background_tasks):  # Create a copy of the set to iterate
         if task.get_coro().__name__ == "record_motor_path":
+            task_found = True
+            logger.info("Requesting cancellation of motor path recording task")
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
-                logger.info("Motor path recording task cancelled successfully")
-            return {
-                "message": "Stopped recording motor path and saved data",
-            }
-    return {
-        "message": "No active motor path recording found",
-    }
+                logger.info("Motor path recording task cancelled and cleaned up successfully")
+            except Exception as e:
+                logger.error(f"Error while cancelling recording task: {e}", exc_info=True)
+            break  # Only cancel the first matching task
+    
+    # Ensure the flag is reset even if the task cleanup didn't work properly
+    if MOTOR_OPERATION_ACTIVE:
+        MOTOR_OPERATION_ACTIVE = False
+        logger.info("Manually unlocked lid after stopping recording")
+    
+    if task_found:
+        return {
+            "message": "Stopped recording motor path and saved data",
+        }
+    else:
+        return {
+            "message": "No active motor path recording found",
+        }
 
 @app.post("/api/v1/motor/test")
 async def test_motors(speed: int = 200, duration: float = 2.0):
@@ -1817,9 +1950,13 @@ async def move_to_dock(dock_id: Optional[str] = "default_path"):
         - message: Status message indicating playback has started
         - dock_id: The dock ID that was targeted
     """
-    task = asyncio.create_task(play_motor_path(dock_id,reverse=True))
+    logger.info(f"=== DOCK ENDPOINT CALLED with dock_id={dock_id} ===")
+    # Create task and keep strong reference by adding to background_tasks set
+    task = asyncio.create_task(play_motor_path(dock_id, reverse=True))
+    # Note: play_motor_path adds itself to background_tasks via asyncio.current_task()
+    logger.info(f"Created dock task for {dock_id}, task will manage itself")
     return {
-        "message": f"Would move to dock {dock_id}",
+        "message": f"Moving to dock {dock_id}",
         "dock_id": dock_id,
     }
 
@@ -1835,9 +1972,13 @@ async def return_from_dock(dock_id: Optional[str] = "default_path"):
         - message: Status message indicating playback has started
         - dock_id: The dock ID that was targeted
     """
-    task = asyncio.create_task(play_motor_path(dock_id,reverse=False))
+    logger.info(f"=== RETURN ENDPOINT CALLED with dock_id={dock_id} ===")
+    # Create task and keep strong reference by adding to background_tasks set
+    task = asyncio.create_task(play_motor_path(dock_id, reverse=False))
+    # Note: play_motor_path adds itself to background_tasks via asyncio.current_task()
+    logger.info(f"Created return task for {dock_id}, task will manage itself")
     return {
-        "message": f"Would return from dock {dock_id}",
+        "message": f"Returning from dock {dock_id}",
         "dock_id": dock_id,
     }
 
@@ -1895,11 +2036,12 @@ async def door_close():
     Example Response:
         ```json
         {
-            "message": "Would close door"
+            "message": "Door closing"
         }
         ```
     """
-    return {"message": "Would close door"}
+    task = asyncio.create_task(close_door())
+    return {"message": "Door closing"}
 
 
 @app.get("/api/v1/environment/temperature")
